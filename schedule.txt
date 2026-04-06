@@ -1,0 +1,10 @@
+ Maze Hill                               23:27
+-----------------------------------------------
+ TIME   DESTINATION              PLAT  STATUS
+-----------------------------------------------
+ 23:30  Gillinagham (Kent)        2    On time
+ 23:39  London Cannon Street      1    On time
+ 23:42  Dartford                  2    On time
+ 00:09  London Bridge             -    On time
+ 00:12  Dartford                  -    On time
+
