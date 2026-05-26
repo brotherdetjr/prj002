@@ -30,19 +30,6 @@ if [ -z "$PORT" ]; then
 fi
 echo "Device : $PORT"
 
-# ── Helper ────────────────────────────────────────────────────────────────────
-prompt_download_mode() {
-    echo ""
-    echo "  ╔═══════════════════════════════════════════╗"
-    echo "  ║  Put the board in download mode:          ║"
-    echo "  ║  1. Hold   BOOT                           ║"
-    echo "  ║  2. Press  RESET  (then release it)       ║"
-    echo "  ║  3. Release BOOT                          ║"
-    echo "  ╚═══════════════════════════════════════════╝"
-    read -rp "  Press Enter when ready... "
-    echo ""
-}
-
 # ── Backup ────────────────────────────────────────────────────────────────────
 if $BACKUP; then
     STAMP=$(date +%Y%d%m%H%M%S)
@@ -50,7 +37,6 @@ if $BACKUP; then
     mkdir -p "$BACKUP_DIR"
     echo "Backup : $BACKUP_DIR"
 
-    prompt_download_mode
     echo "[1/4] Reading firmware from device (this takes ~30 s)..."
     esptool.py --port "$PORT" --baud 921600 --chip esp32s3 \
         read_flash 0 $FLASH_SIZE "$BACKUP_DIR/firmware.bin"
@@ -68,7 +54,6 @@ arduino-cli compile --fqbn "$FQBN" "$SKETCH_DIR"
 
 # ── Upload ────────────────────────────────────────────────────────────────────
 UPLOAD_STEP=$( $BACKUP && echo "[4/4]" || echo "[2/2]" )
-prompt_download_mode
 echo "$UPLOAD_STEP Uploading..."
 arduino-cli upload --fqbn "$FQBN" -p "$PORT" "$SKETCH_DIR"
 
