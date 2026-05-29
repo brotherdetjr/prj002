@@ -119,7 +119,7 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
     320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
-    true /* auto_flush */,
+    false /* auto_flush: we call flush(true) manually after each screen update */,
     bus, GFX_NOT_DEFINED /* RST */,
     mf_st7701_init, sizeof(mf_st7701_init));
 
@@ -222,11 +222,11 @@ static State state = MANDATORY_CONFIG;
 #define IMU_SCL  18
 #define IMU_ADDR 0x6B
 
-#define SHAKE_THRESHOLD_G        12.0f
-#define REQUIRED_SPIKES          4
-#define WINDOW_MS                1000UL
+#define SHAKE_THRESHOLD_G        7.0f
+#define REQUIRED_SPIKES          5
+#define WINDOW_MS                1200UL
 // #define SHAKE_INNER_COOLDOWN_MS  1000UL
-#define SHAKE_COOLDOWN_MS        3000UL
+#define SHAKE_COOLDOWN_MS        2500UL
 #define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
 #define WIFI_AP_SID "DepartBoard"
 #define WIFI_AP_PASS "t123"
@@ -238,8 +238,8 @@ static unsigned long optional_config_enter_ms  = 0;
 static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
 static const float   kAlpha   = 0.98f;
 static unsigned long shake_cooldown_ms = 0;
-static float         dbg_magnitude  = 0.0f;
-static int           dbg_spikes     = 0;
+static float         dbg_magnitude     = 0.0f;
+static int           dbg_spikes        = 0;
 static uint32_t      lastShakeTime     = 0;
 static uint32_t      windowStart       = 0;
 static int           spikeCount        = 0;
@@ -315,7 +315,8 @@ static bool IRAM_ATTR check_shake()
     gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
 
     float dx = ax - gravityX, dy = ay - gravityY, dz = az - gravityZ;
-    float magnitude = sqrtf(dx*dx + dy*dy + dz*dz);
+    // float magnitude = sqrtf(dx*dx + dy*dy + dz*dz);
+    float magnitude = sqrtf(dz*dz);
     if (magnitude > max_mag) max_mag = magnitude;
 
     dbg_magnitude = magnitude;
@@ -466,6 +467,7 @@ static void draw_board()
         gfx->setTextColor(WHITE);
         gfx->setCursor(X_DEST, y + (ROW_H - 24) / 2);
         gfx->print("No services");
+        gfx->flush(true);
         return;
     }
 
@@ -494,6 +496,7 @@ static void draw_board()
         gfx->drawFastHLine(0, y + ROW_H - 1, W, divider);
         y += ROW_H;
     }
+    gfx->flush(true);
 }
 
 static void draw_mandatory_config(const char *reason)
@@ -509,6 +512,7 @@ static void draw_mandatory_config(const char *reason)
     slog(creds);
     slog("Then open in browser:");
     slog("  http://192.168.4.1");
+    gfx->flush(true);
 }
 
 static void draw_optional_config()
@@ -523,6 +527,7 @@ static void draw_optional_config()
     slog("  http://192.168.4.1");
     slog("Or shake to exit");
     slog("Auto-exits in 5 min");
+    gfx->flush(true);
 }
 
 static unsigned long dbg_next_ms = 0;
@@ -532,13 +537,13 @@ static void draw_imu_debug()
     unsigned long now  = millis();
     unsigned long cdwn = (shake_cooldown_ms > now) ? shake_cooldown_ms - now : 0;
     char dbg[48];
-    snprintf(dbg, sizeof(dbg), "mag=%.2f spk=%d cd=%lus",
+    snprintf(dbg, sizeof(dbg), "mag=%5.2f spk=%d cd=%lus",
              dbg_magnitude, dbg_spikes, cdwn / 1000);
-    gfx->fillRect(0, gfx->height() - DBG_H, gfx->width(), DBG_H, BLACK);
     gfx->setTextSize(2);
-    gfx->setTextColor(WHITE);
+    gfx->setTextColor(WHITE, BLACK);
     gfx->setCursor(4, gfx->height() - DBG_H + 7);
     gfx->print(dbg);
+    gfx->flush(true);
 }
 
 // ── Config portal ─────────────────────────────────────────────────────────────
@@ -732,10 +737,10 @@ void loop()
 
     switch (state) {
     case WORKING: {
-        if (millis() >= dbg_next_ms) {
-            dbg_next_ms = millis() + 200;
-            draw_imu_debug();
-        }
+        // if (millis() >= dbg_next_ms) {
+        //     dbg_next_ms = millis() + 200;
+        //     draw_imu_debug();
+        // }
         if (shook) {
             enter_optional_config();
             break;
