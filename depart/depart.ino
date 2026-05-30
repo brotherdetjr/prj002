@@ -222,10 +222,15 @@ static State state = MANDATORY_CONFIG;
 #define IMU_SCL  18
 #define IMU_ADDR 0x6B
 
-#define SHAKE_THRESHOLD_G        7.0f
-#define REQUIRED_SPIKES          5
-#define WINDOW_MS                1200UL
-// #define SHAKE_INNER_COOLDOWN_MS  1000UL
+// Shake = N direction reversals in Z within the window.
+// A reversal fires when dz crosses zero while |dz| exceeds the threshold.
+// This counts half-cycles of the shake oscillation, so it works even when the
+// reading stays elevated between peaks (the old spike-counting approach stalled
+// when a single shake burst lasted longer than the 200 ms minimum inter-spike gap).
+#define SHAKE_THRESHOLD_G        1.5f   // per-axis dynamic g to count a reversal
+#define REQUIRED_REVERSALS       6      // 3 full Z oscillation cycles
+#define REVERSAL_MAX_GAP_MS      400UL  // max gap between reversals (≥ 2.5 Hz)
+#define WINDOW_MS                2000UL
 #define SHAKE_COOLDOWN_MS        2500UL
 #define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
 #define WIFI_AP_SID "DepartBoard"
@@ -239,12 +244,11 @@ static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
 static const float   kAlpha   = 0.98f;
 static unsigned long shake_cooldown_ms = 0;
 static float         dbg_magnitude     = 0.0f;
-static int           dbg_spikes        = 0;
-static uint32_t      lastShakeTime     = 0;
+static int           dbg_spikes        = 0;  // reversal count shown on debug strip
+static int8_t        shakeSign         = 0;  // last sign of dz that crossed threshold
+static int           reversalCount     = 0;
+static uint32_t      lastReversalMs    = 0;
 static uint32_t      windowStart       = 0;
-static int           spikeCount        = 0;
-static uint32_t      lastSpikeMs       = 0;
-static float         max_mag           = 0;
 
 static bool imu_write_reg(uint8_t reg, uint8_t val)
 {
@@ -278,7 +282,7 @@ static void imu_init()
         Serial.printf("IMU: WHO_AM_I=0x%02X (expected 0x05)\n", who);
         return;
     }
-    imu_write_reg(0x03, 0x27);  // CTRL2: ACC ±8 g, 62.5 Hz
+    imu_write_reg(0x03, 0x26);  // CTRL2: ACC ±8 g, 125 Hz
     imu_write_reg(0x08, 0x01);  // CTRL7: ACC enable
     imu_ok = true;
     Serial.println("IMU OK");
@@ -314,33 +318,46 @@ static bool IRAM_ATTR check_shake()
     gravityY = kAlpha * gravityY + (1.0f - kAlpha) * ay;
     gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
 
-    float dx = ax - gravityX, dy = ay - gravityY, dz = az - gravityZ;
-    // float magnitude = sqrtf(dx*dx + dy*dy + dz*dz);
-    float magnitude = sqrtf(dz*dz);
-    if (magnitude > max_mag) max_mag = magnitude;
-
-    dbg_magnitude = magnitude;
+    float dz = az - gravityZ;
+    dbg_magnitude = fabsf(dz);
 
     uint32_t now = millis();
 
-    if (now < shake_cooldown_ms) { dbg_spikes = spikeCount; return false; }
+    if (now < shake_cooldown_ms) { dbg_spikes = reversalCount; return false; }
 
-    if (magnitude > SHAKE_THRESHOLD_G && now - lastSpikeMs >= 200) {
-        if (spikeCount == 0) windowStart = now;
-        spikeCount++;
-        lastSpikeMs = now;
+    // Detect a direction reversal: dz crossed zero while above the threshold.
+    // Each half-cycle of a deliberate shake produces exactly one reversal,
+    // regardless of how long the reading stays elevated within that half-cycle.
+    int8_t sign = (dz > SHAKE_THRESHOLD_G) ? 1 : (dz < -SHAKE_THRESHOLD_G) ? -1 : 0;
+    if (sign != 0 && sign != shakeSign) {
+        if (shakeSign != 0) {
+            // Crossed from one side to the other — count it.
+            if (now - lastReversalMs <= REVERSAL_MAX_GAP_MS) {
+                if (reversalCount == 0) windowStart = now;
+                reversalCount++;
+            } else {
+                // Gap too long — restart the window with this reversal.
+                reversalCount = 1;
+                windowStart   = now;
+            }
+            lastReversalMs = now;
+        }
+        shakeSign = sign;
+    } else if (sign == 0) {
+        shakeSign = 0;  // dz fell back inside the dead-band; allow re-arm
     }
 
-    dbg_spikes = spikeCount;  // post-increment so display shows count as it builds
+    // Expire window if it has gone stale.
+    if (reversalCount > 0 && now - windowStart > WINDOW_MS) reversalCount = 0;
 
-    if (spikeCount >= REQUIRED_SPIKES && (now - windowStart) < WINDOW_MS) {
-        lastShakeTime     = now;
-        spikeCount        = 0;
+    dbg_spikes = reversalCount;
+
+    if (reversalCount >= REQUIRED_REVERSALS) {
+        reversalCount     = 0;
+        shakeSign         = 0;
         shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
         return true;
     }
-
-    if (now - windowStart > WINDOW_MS) spikeCount = 0;
 
     return false;
 }
@@ -530,20 +547,26 @@ static void draw_optional_config()
     gfx->flush(true);
 }
 
-static unsigned long dbg_next_ms = 0;
+static unsigned long dbg_next_ms  = 0;
+static unsigned long dbg_flush_ms = 0;
 
 static void draw_imu_debug()
 {
     unsigned long now  = millis();
     unsigned long cdwn = (shake_cooldown_ms > now) ? shake_cooldown_ms - now : 0;
     char dbg[48];
-    snprintf(dbg, sizeof(dbg), "mag=%5.2f spk=%d cd=%lus",
+    snprintf(dbg, sizeof(dbg), "mag=%5.2f rev=%d cd=%lus",
              dbg_magnitude, dbg_spikes, cdwn / 1000);
     gfx->setTextSize(2);
     gfx->setTextColor(WHITE, BLACK);
     gfx->setCursor(4, gfx->height() - DBG_H + 7);
     gfx->print(dbg);
-    gfx->flush(true);
+    // Flush only once per second: flushing the full 524 KB framebuffer at 5 Hz
+    // causes enough PSRAM bus pressure to stall the bounce-buffer ISR every call.
+    if (now >= dbg_flush_ms) {
+        dbg_flush_ms = now + 1000;
+        gfx->flush(true);
+    }
 }
 
 // ── Config portal ─────────────────────────────────────────────────────────────
