@@ -1,18 +1,24 @@
 /*
  * Makerfabs ESP32-S3 Parallel TFT 3.16" ST7701S
- * Railway departure board — Maze Hill (live via national-rail-api.davwheat.dev)
+ * Railway departure board — live via national-rail-api.davwheat.dev
  *
  * Libraries required (Arduino Library Manager):
  *   - Arduino_GFX_Library  (moononournation)
  *   - ArduinoJson          (bblanchon) v7+
+ *   - QMI8658              (Makerfabs or compatible)
  */
 
 #include <Arduino_GFX_Library.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <WebServer.h>
 #include <time.h>
+#include <sys/time.h>
 
 #define BLACK   RGB565_BLACK
 #define WHITE   RGB565_WHITE
@@ -115,31 +121,88 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
     320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
-    true /* auto_flush */,
+    false /* auto_flush: we call flush(true) manually after each screen update */,
     bus, GFX_NOT_DEFINED /* RST */,
     mf_st7701_init, sizeof(mf_st7701_init));
 
 // ── Screen log ───────────────────────────────────────────────────────────────
 
+#define X_TIME 10  // left margin (px); shared with departure board layout
+
 static int slog_y = 0;
 
-static void slog(const char *msg)
+static void slog(const char *msg, uint16_t color = WHITE)
 {
-    Serial.println(msg);
     gfx->setTextSize(3);
-    gfx->setTextColor(WHITE);
-    gfx->setCursor(4, slog_y);
+    gfx->setTextColor(color);
+    gfx->setCursor(X_TIME, slog_y);
     gfx->print(msg);
-    slog_y += 24;
+    slog_y += 25;
 }
 
-// ── WiFi / API ────────────────────────────────────────────────────────────────
+static bool serial_dbg_anchored = false;
+static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-#define WIFI_SSID    "TALKTALKB4AEB9"
-#define WIFI_PASS    "4CY8RKUE"
-#define STATION_CODE "MZH"
-#define API_URL      "https://national-rail-api.davwheat.dev/departures/" STATION_CODE
-#define REFRESH_MS   60000UL
+// ── Config (persisted to NVS via Preferences) ────────────────────────────────
+
+#define REFRESH_MS 60000UL
+
+static char cfg_ssid[64]   = "";
+static char cfg_pass[64]   = "";
+static char cfg_station[8] = "MZH";
+static char api_url[72]    = "";
+static unsigned long imu_ready_at_ms = 0;
+
+// RTC_NOINIT_ATTR: startup code never re-initialises this section, so values
+// survive esp_restart() (unlike RTC_DATA_ATTR which is re-copied from flash
+// on every non-deep-sleep boot).  Magic number guards against stale data on
+// a true power-on reset.
+#define RTC_SAVE_MAGIC 0xCAFED00D
+RTC_NOINIT_ATTR static uint32_t rtc_magic;
+RTC_NOINIT_ATTR static char     rtc_ssid[64];
+RTC_NOINIT_ATTR static char     rtc_pass[64];
+RTC_NOINIT_ATTR static char     rtc_station[8];
+
+static void load_config()
+{
+    Preferences prefs;
+    bool ok = prefs.begin("depart", true);
+    Serial.printf("Prefs load: begin=%d\n", ok);
+    if (ok) {
+        prefs.getString("ssid",    cfg_ssid,    sizeof(cfg_ssid));
+        prefs.getString("pass",    cfg_pass,    sizeof(cfg_pass));
+        prefs.getString("station", cfg_station, sizeof(cfg_station));
+        prefs.end();
+    }
+    Serial.printf("Prefs load: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
+    snprintf(api_url, sizeof(api_url),
+        "https://national-rail-api.davwheat.dev/departures/%s", cfg_station);
+}
+
+static bool nvs_open_rw(Preferences &prefs)
+{
+    if (prefs.begin("depart", false)) return true;
+    // NVS is corrupted (likely from a crash-interrupted write).  Erase the
+    // whole partition and reinitialise before retrying.
+    Serial.println("NVS open failed — erasing partition and retrying");
+    nvs_flash_erase();
+    nvs_flash_init();
+    return prefs.begin("depart", false);
+}
+
+static void save_config()
+{
+    Preferences prefs;
+    if (!nvs_open_rw(prefs)) {
+        Serial.println("Prefs save: failed to open namespace");
+        return;
+    }
+    prefs.putString("ssid",    cfg_ssid);
+    prefs.putString("pass",    cfg_pass);
+    prefs.putString("station", cfg_station);
+    prefs.end();
+    Serial.printf("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
+}
 
 // ── Departure data ────────────────────────────────────────────────────────────
 
@@ -150,7 +213,6 @@ static void slog(const char *msg)
 //   DEST    left  x=116  (up to ~37 ch before PLAT, truncated in struct)
 //   PLAT    right r=620
 //   STATUS  right r=810  (820 - 10 margin)
-#define X_TIME    10
 #define X_DEST   116
 #define R_PLAT   620   // right edge of PLAT column
 #define R_STATUS 810   // right edge of STATUS column
@@ -158,7 +220,7 @@ static void slog(const char *msg)
 #define CHAR_W  18  // textSize(3): 6 px × 3
 
 #define HDR_H  52   // header section height (px)
-#define ROW_H  42   // height of each table row (px)
+#define ROW_H  38   // height of each table row (px)
 
 #define MAX_DEPARTURES 5
 
@@ -171,25 +233,218 @@ struct Departure {
 
 static Departure board[MAX_DEPARTURES];
 static int N = 0;
-static char station_name[32] = STATION_CODE;  // overwritten by first successful fetch
+static char station_name[32] = "";
+
+// ── State machine ─────────────────────────────────────────────────────────────
+
+enum State { MANDATORY_CONFIG, WORKING, OPTIONAL_CONFIG };
+static State state = MANDATORY_CONFIG;
+
+// ── IMU (QMI8658) ─────────────────────────────────────────────────────────────
+
+#define IMU_SDA  17
+#define IMU_SCL  18
+#define IMU_ADDR 0x6B
+
+// Shake = N direction reversals in Z within the window.
+// A reversal fires when dz crosses zero while |dz| exceeds the threshold.
+// This counts half-cycles of the shake oscillation, so it works even when the
+// reading stays elevated between peaks (the old spike-counting approach stalled
+// when a single shake burst lasted longer than the 200 ms minimum inter-spike gap).
+#define SHAKE_THRESHOLD_G        6.1f   // per-axis dynamic g to count a reversal
+#define REQUIRED_REVERSALS       3      // REQUIRED_REVERSALS / 2 full Z oscillation cycles
+#define REVERSAL_MIN_GAP_MS      80UL   // debounce: ignore reversals closer than this
+#define REVERSAL_MAX_GAP_MS      400UL  // max gap between reversals (≥ 2.5 Hz)
+#define WINDOW_MS                1000UL
+#define SHAKE_COOLDOWN_MS        3000UL
+#define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
+#define WIFI_AP_SID "DepartBoard"
+#define WIFI_AP_PASS "t123"
+
+static bool          imu_ok                    = false;
+static bool          imu_gravity_initialized   = false;
+static unsigned long optional_config_enter_ms  = 0;
+
+static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
+static const float   kAlpha   = 0.98f;
+static unsigned long shake_cooldown_ms = 0;
+static float         dbg_magnitude     = 0.0f;
+static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dy = 0, dbg_dz = 0;
+static int           dbg_spikes        = 0;  // reversal count shown on debug strip
+static int8_t        shakeSignY        = 0;
+static int8_t        shakeSignZ        = 0;
+static int           reversalCount     = 0;
+static uint32_t      lastReversalMs    = 0;
+static uint32_t      windowStart       = 0;
+
+static bool imu_write_reg(uint8_t reg, uint8_t val)
+{
+    Wire.beginTransmission(IMU_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
+// IRAM_ATTR: called from loop() while WiFi may have flash cache disabled
+static bool IRAM_ATTR imu_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    Wire.beginTransmission(IMU_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    Wire.requestFrom((uint8_t)IMU_ADDR, len);
+    for (uint8_t i = 0; i < len; i++) {
+        if (!Wire.available()) return false;
+        buf[i] = Wire.read();
+    }
+    return true;
+}
+
+static void imu_init()
+{
+    Wire.begin(IMU_SDA, IMU_SCL);
+    delay(50);  // let IMU power rail stabilise
+    uint8_t who = 0;
+    imu_read_regs(0x00, &who, 1);
+    if (who != 0x05) {
+        Serial.printf("IMU: WHO_AM_I=0x%02X (expected 0x05)\n", who);
+        return;
+    }
+    imu_write_reg(0x03, 0x26);  // CTRL2: ACC ±8 g, 125 Hz
+    imu_write_reg(0x08, 0x01);  // CTRL7: ACC enable
+    imu_ok = true;
+    Serial.println("IMU OK");
+}
+
+static bool IRAM_ATTR check_shake()
+{
+    if (!imu_ok) return false;
+    if (millis() < imu_ready_at_ms) return false;
+
+    uint8_t buf[6];
+    if (!imu_read_regs(0x35, buf, 6)) return false;
+
+    int16_t rx = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
+    int16_t ry = (int16_t)((uint16_t)buf[3] << 8 | buf[2]);
+    int16_t rz = (int16_t)((uint16_t)buf[5] << 8 | buf[4]);
+    const float scale = 8.0f / 32768.0f;  // ±8 g, 16-bit
+    float ax = rx * scale, ay = ry * scale, az = rz * scale;
+
+    // Seed gravity to current orientation on first reading (avoids cold-start
+    // magnitude spike and the post-shake distortion: a hard shake drags the
+    // filter away from true gravity; if cooldown then blocks updates, the filter
+    // stays distorted and fires false spikes the moment cooldown expires).
+    if (!imu_gravity_initialized) {
+        gravityX = ax; gravityY = ay; gravityZ = az;
+        imu_gravity_initialized = true;
+        return false;
+    }
+
+    // Always update — even during shake_cooldown — so the filter re-converges
+    // to true gravity while we wait and won't misfire when cooldown lifts.
+    gravityX = kAlpha * gravityX + (1.0f - kAlpha) * ax;
+    gravityY = kAlpha * gravityY + (1.0f - kAlpha) * ay;
+    gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
+
+    float dy = ay - gravityY;
+    float dz = az - gravityZ;
+    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dy = dy; dbg_dz = dz;
+    dbg_magnitude = fmaxf(fabsf(dy), fabsf(dz));
+
+    uint32_t now = millis();
+
+    if (now < shake_cooldown_ms) { dbg_spikes = reversalCount; return false; }
+
+    // Count a reversal on either Y or Z into the shared counter.
+    auto check_axis = [&](float d, int8_t &axisSign) {
+        int8_t sign = (d > SHAKE_THRESHOLD_G) ? 1 : (d < -SHAKE_THRESHOLD_G) ? -1 : 0;
+        if (sign != 0 && sign != axisSign) {
+            if (axisSign != 0) {
+                uint32_t gap = now - lastReversalMs;
+                if (gap >= REVERSAL_MIN_GAP_MS) {
+                    if (gap <= REVERSAL_MAX_GAP_MS) {
+                        if (reversalCount == 0) windowStart = now;
+                        reversalCount++;
+                    } else {
+                        reversalCount = 1;
+                        windowStart   = now;
+                    }
+                    lastReversalMs = now;
+                }
+            }
+            axisSign = sign;
+        } else if (sign == 0) {
+            axisSign = 0;
+        }
+    };
+    check_axis(dy, shakeSignY);
+    check_axis(dz, shakeSignZ);
+
+    // Expire window if it has gone stale.
+    if (reversalCount > 0 && now - windowStart > WINDOW_MS) reversalCount = 0;
+
+    dbg_spikes = reversalCount;
+
+    if (reversalCount >= REQUIRED_REVERSALS) {
+        reversalCount     = 0;
+        shakeSignY        = 0;
+        shakeSignZ        = 0;
+        shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
+        return true;
+    }
+
+    return false;
+}
+
+// ── Serial logging ────────────────────────────────────────────────────────────
+
+static void serial_log(const char *fmt, ...)
+{
+    serial_dbg_anchored = false;
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    struct tm t;
+    localtime_r(&tv.tv_sec, &t);
+    Serial.printf("%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec, tv.tv_usec / 1000);
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Serial.print(buf);
+}
+
+static void serial_imu_debug()
+{
+    if (serial_dbg_anchored) Serial.print("\033[2A\r");
+    serial_dbg_anchored = true;
+    unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
+    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dy=%6.2f  dz=%6.2f\n",
+                  dbg_ax, dbg_ay, dbg_az, dbg_dy, dbg_dz);
+    Serial.printf("mag=%5.2f  rev=%d  cd=%lus                    \n",
+                  dbg_magnitude, dbg_spikes, cdwn);
+}
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-static bool fetch_departures()
+static bool fetch_departures(char *err_buf, size_t err_len)
 {
+    serial_log("Fetch: %s\n", api_url);
     WiFiClientSecure client;
     // Skips certificate verification — fine for a local hobby device.
-    // For stricter setups, call client.setCACert(ISRG_ROOT_X1_PEM) instead.
     client.setInsecure();
 
     HTTPClient http;
-    if (!http.begin(client, API_URL)) return false;
+    if (!http.begin(client, api_url)) {
+        strlcpy(err_buf, "HTTP begin failed", err_len);
+        return false;
+    }
 
     int code = http.GET();
-    char dbg[48];
-    snprintf(dbg, sizeof(dbg), "HTTP: %d", code);
-    slog(dbg);
+    serial_log("Fetch: HTTP %d\n", code);
     if (code != HTTP_CODE_OK) {
+        snprintf(err_buf, err_len, "HTTP %d from %s", code, cfg_station);
         http.end();
         return false;
     }
@@ -198,15 +453,13 @@ static bool fetch_departures()
     http.end();
 
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
-
-    if (err) {
-        snprintf(dbg, sizeof(dbg), "JSON err: %s", err.c_str());
-        slog(dbg);
+    DeserializationError jerr = deserializeJson(doc, body);
+    if (jerr) {
+        snprintf(err_buf, err_len, "JSON err: %s", jerr.c_str());
         return false;
     }
 
-    strlcpy(station_name, doc["locationName"] | STATION_CODE, sizeof(station_name));
+    strlcpy(station_name, doc["locationName"] | cfg_station, sizeof(station_name));
 
     // Prefer train services; fall back to bus replacements when trains are absent.
     JsonArray services = doc["trainServices"];
@@ -249,6 +502,7 @@ static bool fetch_departures()
 
 static void draw_board()
 {
+    serial_log("Screen: departure board\n");
     const int W = gfx->width();   // 820
     const int H = gfx->height();  // 320
 
@@ -297,6 +551,7 @@ static void draw_board()
         gfx->setTextColor(WHITE);
         gfx->setCursor(X_DEST, y + (ROW_H - 24) / 2);
         gfx->print("No services");
+        gfx->flush(true);
         return;
     }
 
@@ -325,80 +580,295 @@ static void draw_board()
         gfx->drawFastHLine(0, y + ROW_H - 1, W, divider);
         y += ROW_H;
     }
+    gfx->flush(true);
+}
+
+static void draw_mandatory_config(const char *reason)
+{
+    serial_log("Screen: mandatory config (%s)\n", reason);
+    gfx->fillScreen(BLACK);
+    slog_y = X_TIME;
+    slog("CONFIG REQUIRED!", RED);
+    slog(reason);
+    slog("");
+    slog("Connect to WiFi:");
+    char creds[32] = "";
+    snprintf(creds, sizeof(creds), "  %s / %s", WIFI_AP_SID, WIFI_AP_PASS);
+    slog(creds);
+    slog("Then open in browser:");
+    slog("  http://192.168.4.1");
+    gfx->flush(true);
+}
+
+static void draw_optional_config()
+{
+    serial_log("Screen: optional config\n");
+    gfx->fillScreen(BLACK);
+    slog_y = X_TIME;
+    slog("CONFIG MODE", YELLOW);
+    slog("Connect to WiFi:");
+    char creds[32] = "";
+    snprintf(creds, sizeof(creds), "  %s / %s", WIFI_AP_SID, WIFI_AP_PASS);
+    slog(creds);
+    slog("Then open in browser:");
+    slog("  http://192.168.4.1");
+    slog("Or shake to exit");
+    slog("Auto-exits in 5 min");
+    gfx->flush(true);
+}
+
+
+
+// ── Config portal ─────────────────────────────────────────────────────────────
+
+static const char CONFIG_HTML[] =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Departure Board</title>"
+    "<style>"
+    "body{font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em}"
+    "h1{font-size:1.4em}"
+    "label{display:block;margin-top:1em;font-weight:bold}"
+    "input{width:100%;padding:.5em;font-size:1em;box-sizing:border-box}"
+    "small{color:#666}"
+    "button{margin-top:1.5em;width:100%;padding:.75em;font-size:1em;"
+    "background:#00408a;color:#fff;border:none;border-radius:4px;cursor:pointer}"
+    "</style></head><body>"
+    "<h1>Departure Board</h1>"
+    "<form method=POST action=/save>"
+    "<label>WiFi network</label>"
+    "<input name=ssid value='%SSID%'>"
+    "<label>WiFi password</label>"
+    "<input name=pass value='%PASS%'>"
+    "<label>Station code</label>"
+    "<input name=station value='%CODE%' maxlength=4 placeholder='e.g. MZH'>"
+    "<small>3-letter CRS code &mdash; "
+    "<a href=https://www.nationalrail.co.uk/stations_destinations/48541.aspx target=_blank>"
+    "find yours here</a></small>"
+    "<br><button>Save &amp; Reboot</button>"
+    "</form></body></html>";
+
+static WebServer     server(80);
+static bool          portal_active   = false;
+static unsigned long restart_at_ms   = 0;
+
+static void portal_start()
+{
+    if (portal_active) return;
+    server.on("/", HTTP_GET, []() {
+        String html = CONFIG_HTML;
+        html.replace("%SSID%", cfg_ssid);
+        html.replace("%PASS%", cfg_pass);
+        html.replace("%CODE%", cfg_station);
+        server.send(200, "text/html; charset=utf-8", html);
+    });
+    server.on("/save", HTTP_POST, []() {
+        if (server.hasArg("ssid"))    server.arg("ssid").toCharArray(rtc_ssid, sizeof(rtc_ssid));
+        if (server.hasArg("pass"))    server.arg("pass").toCharArray(rtc_pass, sizeof(rtc_pass));
+        if (server.hasArg("station")) {
+            String s = server.arg("station");
+            s.toUpperCase();
+            s.toCharArray(rtc_station, sizeof(rtc_station));
+        }
+        rtc_magic     = RTC_SAVE_MAGIC;
+        restart_at_ms = millis() + 1000;
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html",
+            "<html><body><h1>Saved!</h1><p>Restarting...</p></body></html>");
+    });
+    server.begin();
+    portal_active = true;
+}
+
+static void portal_stop()
+{
+    if (!portal_active) return;
+    server.stop();
+    portal_active = false;
+}
+
+// ── State transitions ─────────────────────────────────────────────────────────
+
+// Switches WiFi to pure AP mode, draws the error screen, and starts the portal.
+// Safe to call from any state.
+static void enter_mandatory_config(const char *reason)
+{
+    imu_ready_at_ms = millis() + 2000;  // WiFi mode change may write NVS → suppress Wire reads
+    portal_stop();
+    WiFi.mode(WIFI_AP_STA);
+    delay(100);
+    WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+    draw_mandatory_config(reason);
+    portal_start();
+    state = MANDATORY_CONFIG;
+}
+
+// Adds AP alongside the existing STA connection so home WiFi stays active.
+static void enter_optional_config()
+{
+    imu_ready_at_ms = millis() + 2000;  // WiFi mode change may write NVS → suppress Wire reads
+    WiFi.mode(WIFI_AP_STA);
+    delay(100);
+    WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+    draw_optional_config();
+    portal_start();
+    optional_config_enter_ms = millis();
+    state = OPTIONAL_CONFIG;
 }
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
 
-static unsigned long last_fetch = 0;  // global so setup() can prime it
+static unsigned long last_fetch      = 0;
+static unsigned long serial_dbg_ms   = 0;
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("\n--- setup start ---");
 
-    // ── Display first so slog() works immediately ──────────────────────────
-    pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, LOW); // LOW = ON (NPN transistor, active-low)
-
-    // ── WiFi before display ────────────────────────────────────────────────
-    // WiFi init briefly disables the flash cache for RF calibration.
-    // Starting it before gfx->begin() ensures the LCD DMA never runs during
-    // that window, avoiding the "Cache disabled but cached memory region
-    // accessed" panic.
-    char buf[48];
-    Serial.printf("WiFi: connecting to %s\n", WIFI_SSID);
-
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-        delay(500);
-        Serial.print(".");
+    // Deferred NVS write from the previous boot's config save.
+    // Done here, before any peripheral is initialised, so no ISR can access
+    // cached memory (PSRAM/DROM) while the flash cache is briefly disabled.
+    bool save_pending = (rtc_magic == RTC_SAVE_MAGIC);
+    Serial.printf("RTC save pending=%d station='%s'\n", save_pending, save_pending ? rtc_station : "");
+    if (save_pending) {
+        rtc_magic = 0;
+        strlcpy(cfg_ssid,    rtc_ssid,    sizeof(cfg_ssid));
+        strlcpy(cfg_pass,    rtc_pass,    sizeof(cfg_pass));
+        strlcpy(cfg_station, rtc_station, sizeof(cfg_station));
+        save_config();
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\nWiFi OK: %s\n", WiFi.localIP().toString().c_str());
-        // UK time: GMT in winter, BST (UTC+1) in summer
-        configTime(0, 0, "pool.ntp.org");
-        setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
-        tzset();
-        Serial.println("NTP sync done");
+    load_config();
+    imu_init();  // must be before WiFi — Wire.begin() after WiFi+LCD causes a cache panic
+
+    // WiFi must come before display — RF calibration briefly disables the flash
+    // cache; LCD DMA firing during that window causes a Cache panic.
+    // Block IMU polling until RF calibration is well clear.
+    imu_ready_at_ms = millis() + 2000;
+    bool wifi_ok = false;
+    char reason[64] = "";
+
+    if (strlen(cfg_ssid) == 0) {
+        strlcpy(reason, "No WiFi configured", sizeof(reason));
+        WiFi.mode(WIFI_AP_STA);
+        delay(100);
+        WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
     } else {
-        Serial.println("\nWiFi FAILED - no network");
+        Serial.printf("WiFi: connecting to %s\n", cfg_ssid);
+        WiFi.persistent(false);  // don't write credentials to NVS — avoids cache-disable window
+        WiFi.begin(cfg_ssid, cfg_pass);
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+            wifi_ok = true;
+            Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
+            configTime(0, 0, "pool.ntp.org");
+            setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+            tzset();
+        } else {
+            snprintf(reason, sizeof(reason), "No WiFi: %s pw:%d", cfg_ssid, (int)strlen(cfg_pass));
+            WiFi.mode(WIFI_AP_STA);
+            delay(100);
+            WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+        }
     }
 
-    // ── Display ────────────────────────────────────────────────────────────
+    // Display init (always after WiFi)
+    pinMode(GFX_BL, OUTPUT);
+    digitalWrite(GFX_BL, LOW);  // LOW = ON (NPN transistor)
     if (!gfx->begin()) {
         Serial.println("ERROR: display init failed");
         while (1) delay(100);
     }
-    Serial.println("Display OK");
     gfx->fillScreen(BLACK);
 
-    // ── First fetch ────────────────────────────────────────────────────────
-    slog("Fetching...");
-    bool ok = fetch_departures();
-    snprintf(buf, sizeof(buf), "Fetch:%s N:%d %s", ok?"OK":"FAIL", N, station_name);
-    slog(buf);
-    last_fetch = millis();  // prevents loop() from re-fetching immediately
+    if (!wifi_ok) {
+        draw_mandatory_config(reason);
+        portal_start();
+        state = MANDATORY_CONFIG;
+        return;
+    }
 
-    delay(4000);  // pause so you can read the slog output
+    char err[64] = "";
+    if (!fetch_departures(err, sizeof(err))) {
+        // WiFi connected but fetch failed — switch to AP and show config screen.
+        WiFi.mode(WIFI_AP_STA);
+        delay(100);
+        WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+        draw_mandatory_config(err);
+        portal_start();
+        state = MANDATORY_CONFIG;
+        return;
+    }
 
-    // ── Draw ───────────────────────────────────────────────────────────────
-    gfx->fillScreen(BLACK);
-    slog_y = 0;
+    last_fetch = millis();
     draw_board();
-    Serial.println("--- setup done ---");
+    state = WORKING;
 }
 
 void loop()
 {
-    unsigned long now = millis();
-    if (now - last_fetch >= REFRESH_MS) {
-        last_fetch = now;
-        if (fetch_departures()) {
+    if (portal_active) server.handleClient();
+
+    if (restart_at_ms && millis() >= restart_at_ms) {
+        portal_stop();
+        ESP.restart();
+    }
+
+    bool shook = check_shake();
+
+    switch (state) {
+    case WORKING: {
+        if (shook) {
+            enter_optional_config();
+            break;
+        }
+        unsigned long now = millis();
+        if (now - last_fetch >= REFRESH_MS) {
+            last_fetch = now;
+            char err[64] = "";
+            if (fetch_departures(err, sizeof(err))) {
+                gfx->fillScreen(BLACK);
+                draw_board();
+            } else {
+                enter_mandatory_config(err);
+            }
+        }
+        break;
+    }
+    case OPTIONAL_CONFIG: {
+        bool timed_out = (millis() - optional_config_enter_ms >= OPTIONAL_CONFIG_TIMEOUT_MS);
+        if (shook || timed_out) {
+            portal_stop();
+            unsigned long now = millis();
+            if (now - last_fetch >= REFRESH_MS) {
+                char err[64] = "";
+                if (!fetch_departures(err, sizeof(err))) {
+                    enter_mandatory_config(err);
+                    break;
+                }
+                last_fetch = now;
+            }
+            state = WORKING;
             gfx->fillScreen(BLACK);
             draw_board();
         }
+        break;
     }
-    delay(1000);
+    case MANDATORY_CONFIG:
+        // Portal handled above; nothing else to do here.
+        break;
+    }
+
+    if (millis() >= serial_dbg_ms) {
+        serial_dbg_ms = millis() + 200;
+        serial_imu_debug();
+    }
+
+    delay(10);  // ~100 Hz — matches QMI8658 shake detection polling rate
 }
