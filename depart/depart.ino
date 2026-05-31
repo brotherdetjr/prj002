@@ -248,7 +248,7 @@ static State state = MANDATORY_CONFIG;
 #define IMU_SCL  18
 #define IMU_ADDR 0x6B
 
-#define SHAKE_PEAK_THRESH  3.0f   // |dominant axis| required to register a strong peak
+#define SHAKE_PEAK_THRESH  3.2f   // |dominant axis| required to register a strong peak
 #define SHAKE_ALT_DECAY    0.96f  // per-sample decay factor for alternation counter
 #define SHAKE_ALT_ENTER    2.5f   // alternation count to enter shaking
 #define SHAKE_ALT_EXIT     1.5f   // alternation count to exit shaking
