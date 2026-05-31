@@ -139,6 +139,9 @@ static void slog(const char *msg, uint16_t color = WHITE)
     slog_y += 25;
 }
 
+static bool serial_dbg_anchored = false;
+static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // ── Config (persisted to NVS via Preferences) ────────────────────────────────
 
 #define REFRESH_MS 60000UL
@@ -170,13 +173,13 @@ static void save_config()
     imu_ready_at_ms = millis() + 5000;  // NVS erase+write may disable cache for tens of ms
     Preferences prefs;
     bool ok = prefs.begin("depart", false);
-    Serial.printf("Prefs save: begin=%d\n", ok);
+    serial_log("Prefs save: begin=%d\n", ok);
     if (ok) {
         prefs.putString("ssid",    cfg_ssid);
         prefs.putString("pass",    cfg_pass);
         prefs.putString("station", cfg_station);
         prefs.end();
-        Serial.printf("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
+        serial_log("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
     }
 }
 
@@ -373,9 +376,6 @@ static bool IRAM_ATTR check_shake()
 
 // ── Serial logging ────────────────────────────────────────────────────────────
 
-static bool serial_dbg_anchored = false;
-
-static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void serial_log(const char *fmt, ...)
 {
     serial_dbg_anchored = false;
