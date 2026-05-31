@@ -129,7 +129,6 @@ static int slog_y = 0;
 
 static void slog(const char *msg)
 {
-    Serial.println(msg);
     gfx->setTextSize(3);
     gfx->setTextColor(WHITE);
     gfx->setCursor(4, slog_y);
@@ -196,7 +195,6 @@ static void save_config()
 
 #define HDR_H  52   // header section height (px)
 #define ROW_H  38   // height of each table row (px)
-#define DBG_H  30   // bottom debug strip height (px)
 
 #define MAX_DEPARTURES 5
 
@@ -244,6 +242,7 @@ static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
 static const float   kAlpha   = 0.98f;
 static unsigned long shake_cooldown_ms = 0;
 static float         dbg_magnitude     = 0.0f;
+static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dz = 0;
 static int           dbg_spikes        = 0;  // reversal count shown on debug strip
 static int8_t        shakeSign         = 0;  // last sign of dz that crossed threshold
 static int           reversalCount     = 0;
@@ -319,6 +318,7 @@ static bool IRAM_ATTR check_shake()
     gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
 
     float dz = az - gravityZ;
+    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dz = dz;
     dbg_magnitude = fabsf(dz);
 
     uint32_t now = millis();
@@ -362,10 +362,38 @@ static bool IRAM_ATTR check_shake()
     return false;
 }
 
+// ── Serial logging ────────────────────────────────────────────────────────────
+
+static bool serial_dbg_anchored = false;
+
+static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void serial_log(const char *fmt, ...)
+{
+    serial_dbg_anchored = false;
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Serial.print(buf);
+}
+
+static void serial_imu_debug()
+{
+    if (serial_dbg_anchored) Serial.print("\033[2A\r");
+    serial_dbg_anchored = true;
+    unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
+    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dz=%6.2f\n",
+                  dbg_ax, dbg_ay, dbg_az, dbg_dz);
+    Serial.printf("mag=%5.2f  rev=%d  cd=%lus          \n",
+                  dbg_magnitude, dbg_spikes, cdwn);
+}
+
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
 static bool fetch_departures(char *err_buf, size_t err_len)
 {
+    serial_log("Fetch: %s\n", api_url);
     WiFiClientSecure client;
     // Skips certificate verification — fine for a local hobby device.
     client.setInsecure();
@@ -377,6 +405,7 @@ static bool fetch_departures(char *err_buf, size_t err_len)
     }
 
     int code = http.GET();
+    serial_log("Fetch: HTTP %d\n", code);
     if (code != HTTP_CODE_OK) {
         snprintf(err_buf, err_len, "HTTP %d from %s", code, cfg_station);
         http.end();
@@ -436,6 +465,7 @@ static bool fetch_departures(char *err_buf, size_t err_len)
 
 static void draw_board()
 {
+    serial_log("Screen: departure board\n");
     const int W = gfx->width();   // 820
     const int H = gfx->height();  // 320
 
@@ -518,6 +548,7 @@ static void draw_board()
 
 static void draw_mandatory_config(const char *reason)
 {
+    serial_log("Screen: mandatory config (%s)\n", reason);
     gfx->fillScreen(BLACK);
     slog_y = 0;
     slog("! CONFIG REQUIRED !");
@@ -534,6 +565,7 @@ static void draw_mandatory_config(const char *reason)
 
 static void draw_optional_config()
 {
+    serial_log("Screen: optional config\n");
     gfx->fillScreen(BLACK);
     slog_y = 0;
     slog("Connect to WiFi:");
@@ -547,27 +579,7 @@ static void draw_optional_config()
     gfx->flush(true);
 }
 
-static unsigned long dbg_next_ms  = 0;
-static unsigned long dbg_flush_ms = 0;
 
-static void draw_imu_debug()
-{
-    unsigned long now  = millis();
-    unsigned long cdwn = (shake_cooldown_ms > now) ? shake_cooldown_ms - now : 0;
-    char dbg[48];
-    snprintf(dbg, sizeof(dbg), "mag=%5.2f rev=%d cd=%lus",
-             dbg_magnitude, dbg_spikes, cdwn / 1000);
-    gfx->setTextSize(2);
-    gfx->setTextColor(WHITE, BLACK);
-    gfx->setCursor(4, gfx->height() - DBG_H + 7);
-    gfx->print(dbg);
-    // Flush only once per second: flushing the full 524 KB framebuffer at 5 Hz
-    // causes enough PSRAM bus pressure to stall the bounce-buffer ISR every call.
-    if (now >= dbg_flush_ms) {
-        dbg_flush_ms = now + 1000;
-        gfx->flush(true);
-    }
-}
 
 // ── Config portal ─────────────────────────────────────────────────────────────
 
@@ -673,7 +685,8 @@ static void enter_optional_config()
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
 
-static unsigned long last_fetch = 0;
+static unsigned long last_fetch      = 0;
+static unsigned long serial_dbg_ms   = 0;
 
 void setup()
 {
@@ -760,10 +773,6 @@ void loop()
 
     switch (state) {
     case WORKING: {
-        // if (millis() >= dbg_next_ms) {
-        //     dbg_next_ms = millis() + 200;
-        //     draw_imu_debug();
-        // }
         if (shook) {
             enter_optional_config();
             break;
@@ -782,11 +791,6 @@ void loop()
         break;
     }
     case OPTIONAL_CONFIG: {
-        if (millis() >= dbg_next_ms) {
-            dbg_next_ms = millis() + 200;
-            draw_imu_debug();
-        }
-
         bool timed_out = (millis() - optional_config_enter_ms >= OPTIONAL_CONFIG_TIMEOUT_MS);
         if (shook || timed_out) {
             portal_stop();
@@ -805,6 +809,11 @@ void loop()
     case MANDATORY_CONFIG:
         // Portal handled above; nothing else to do here.
         break;
+    }
+
+    if (millis() >= serial_dbg_ms) {
+        serial_dbg_ms = millis() + 200;
+        serial_imu_debug();
     }
 
     delay(10);  // ~100 Hz — matches QMI8658 shake detection polling rate

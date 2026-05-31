@@ -14,7 +14,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKETCH_DIR="$SCRIPT_DIR/depart"
 BACKUP_ROOT="$SCRIPT_DIR/backups"
-FQBN="esp32:esp32:esp32s3:PSRAM=opi"
+FQBN="esp32:esp32:esp32s3:PSRAM=opi,CDCOnBoot=cdc"
 FLASH_SIZE="0x400000"  # 4 MB — standard ESP32-S3 flash
 
 # ── Find device port ──────────────────────────────────────────────────────────
