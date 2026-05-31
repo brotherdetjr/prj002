@@ -3,12 +3,15 @@
 # Before flashing, reads current firmware from device and saves it with the
 # sketch source to backups/YYYYDDMMHHmmSS.bak/
 # Use --no-backup to skip the backup step.
+# Use --debug to open the serial monitor after uploading.
 
 set -euo pipefail
 
 BACKUP=true
+DEBUG=false
 for arg in "$@"; do
     [ "$arg" = "--no-backup" ] && BACKUP=false
+    [ "$arg" = "--debug" ]     && DEBUG=true
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -65,4 +68,9 @@ if $BACKUP; then
     echo "      write_flash 0 $BACKUP_DIR/firmware.bin"
 else
     echo "Done."
+fi
+
+if $DEBUG; then
+    echo "Opening serial monitor on $PORT..."
+    arduino-cli monitor -p "$PORT" -c baudrate=115200
 fi

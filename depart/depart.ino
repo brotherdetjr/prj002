@@ -17,6 +17,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <time.h>
+#include <sys/time.h>
 
 #define BLACK   RGB565_BLACK
 #define WHITE   RGB565_WHITE
@@ -370,6 +371,13 @@ static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)
 static void serial_log(const char *fmt, ...)
 {
     serial_dbg_anchored = false;
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    struct tm t;
+    localtime_r(&tv.tv_sec, &t);
+    Serial.printf("%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec, tv.tv_usec / 1000);
     char buf[128];
     va_list ap;
     va_start(ap, fmt);
