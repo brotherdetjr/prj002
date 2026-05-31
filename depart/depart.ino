@@ -235,6 +235,7 @@ struct Departure {
 static Departure board[MAX_DEPARTURES];
 static int N = 0;
 static char station_name[32] = "";
+static int  last_drawn_hhmm  = -1;  // hour*60+min at last draw_board(); -1 = never drawn
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -247,12 +248,10 @@ static State state = MANDATORY_CONFIG;
 #define IMU_SCL  18
 #define IMU_ADDR 0x6B
 
-#define SHAKE_ENERGY_ALPHA    0.80f   // EMA alpha for motion magnitude smoothing
-#define SHAKE_ENERGY_ENTER    8.0f   // enter shaking when smoothed energy exceeds this
-#define SHAKE_ENERGY_EXIT     3.5f   // exit shaking when energy drops below this
-#define SHAKE_REVERSAL_THRESH 2.0f   // dominant-axis threshold for sign reversal
-#define SHAKE_COUNT_ALPHA     0.92f  // per-sample decay factor for reversal counter
-#define SHAKE_COUNT_ENTER     2.5f   // min reversal count to confirm shaking
+#define SHAKE_PEAK_THRESH  3.0f   // |dominant axis| required to register a strong peak
+#define SHAKE_ALT_DECAY    0.96f  // per-sample decay factor for alternation counter
+#define SHAKE_ALT_ENTER    2.5f   // alternation count to enter shaking
+#define SHAKE_ALT_EXIT     1.5f   // alternation count to exit shaking
 #define SHAKE_COOLDOWN_MS     3000UL
 #define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
 #define WIFI_AP_SID "DepartBoard"
@@ -269,9 +268,8 @@ static unsigned long shake_cooldown_ms = 0;
 static float         dbg_energy        = 0.0f;
 static float         dbg_count         = 0.0f;
 static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dx = 0, dbg_dy = 0, dbg_dz = 0;
-static float         shakeEnergy       = 0.0f;
-static float         shakeCount        = 0.0f;
-static float         prevDominant      = 0.0f;
+static float         alternations      = 0.0f;
+static int           lastStrongSign    = 0;
 static bool          shaking           = false;
 
 static bool imu_write_reg(uint8_t reg, uint8_t val)
@@ -342,10 +340,6 @@ static bool IRAM_ATTR check_shake()
     float dz = az - gravityZ;
     dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dx = dx; dbg_dy = dy; dbg_dz = dz;
 
-    // Smoothed L1 motion magnitude
-    float motion = fabsf(dx) + fabsf(dy) + fabsf(dz);
-    shakeEnergy = shakeEnergy * SHAKE_ENERGY_ALPHA + motion * (1.0f - SHAKE_ENERGY_ALPHA);
-
     // Dominant axis: whichever of dx/dy/dz has the largest absolute value
     float axAbs = fabsf(dx), ayAbs = fabsf(dy), azAbs = fabsf(dz);
     float dominant;
@@ -353,29 +347,30 @@ static bool IRAM_ATTR check_shake()
     else if (ayAbs > azAbs)              dominant = dy;
     else                                 dominant = dz;
 
-    // Increment counter on sign reversal; decay every sample
-    if ((dominant >  SHAKE_REVERSAL_THRESH && prevDominant < -SHAKE_REVERSAL_THRESH) ||
-        (dominant < -SHAKE_REVERSAL_THRESH && prevDominant >  SHAKE_REVERSAL_THRESH))
-    {
-        shakeCount += 1.0f;
+    // Count sign reversals of the dominant axis above the peak threshold
+    if (fabsf(dominant) > SHAKE_PEAK_THRESH) {
+        int sign = dominant > 0.0f ? 1 : -1;
+        if (sign != lastStrongSign) {
+            alternations += 1.0f;
+            lastStrongSign = sign;
+        }
     }
-    prevDominant = dominant;
-    shakeCount  *= SHAKE_COUNT_ALPHA;
+    alternations *= SHAKE_ALT_DECAY;
 
-    dbg_energy = shakeEnergy;
-    dbg_count  = shakeCount;
+    dbg_energy = alternations;
+    dbg_count  = (float)lastStrongSign;
 
     uint32_t now = millis();
     if (now < shake_cooldown_ms) return false;
 
     if (!shaking) {
-        if (shakeEnergy > SHAKE_ENERGY_ENTER && shakeCount > SHAKE_COUNT_ENTER) {
+        if (alternations > SHAKE_ALT_ENTER) {
             shaking           = true;
             shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
             return true;
         }
     } else {
-        if (shakeEnergy < SHAKE_ENERGY_EXIT) {
+        if (alternations < SHAKE_ALT_EXIT) {
             shaking = false;
         }
     }
@@ -409,8 +404,8 @@ static void serial_imu_debug()
     unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
     Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dx=%6.2f  dy=%6.2f  dz=%6.2f\n",
                   dbg_ax, dbg_ay, dbg_az, dbg_dx, dbg_dy, dbg_dz);
-    Serial.printf("energy=%5.2f  count=%4.2f  cd=%lus%s\n",
-                  dbg_energy, dbg_count, cdwn, shaking ? " [SHAKING]" : "          ");
+    Serial.printf("alts=%5.2f  sign=%+2d     cd=%lus%s\n",
+                  dbg_energy, (int)dbg_count, cdwn, shaking ? " [SHAKING]" : "          ");
 }
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
@@ -519,8 +514,10 @@ static void draw_board()
     struct tm t;
     if (getLocalTime(&t, 2000)) {
         snprintf(ts, sizeof(ts), "%02d:%02d", t.tm_hour, t.tm_min);
+        last_drawn_hhmm = t.tm_hour * 60 + t.tm_min;
     } else {
         strlcpy(ts, "--:--", sizeof(ts));
+        last_drawn_hhmm = -1;
     }
     gfx->setTextColor(WHITE);
     gfx->setCursor(W - 5 * CHAR_W - X_TIME, hy);
@@ -843,8 +840,14 @@ void loop()
         }
         if (ntp_synced) {
             ntp_synced = false;
-            gfx->fillScreen(BLACK);
-            draw_board();
+            struct tm _t;
+            if (getLocalTime(&_t, 0)) {
+                int cur_hhmm = _t.tm_hour * 60 + _t.tm_min;
+                if (cur_hhmm != last_drawn_hhmm) {
+                    gfx->fillScreen(BLACK);
+                    draw_board();
+                }
+            }
         }
         unsigned long now = millis();
         if (now - last_fetch >= REFRESH_MS) {
