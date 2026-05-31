@@ -348,8 +348,8 @@ static bool IRAM_ATTR check_shake()
     float axAbs = fabsf(dx), ayAbs = fabsf(dy), azAbs = fabsf(dz);
     float dominant;
     if (axAbs > ayAbs && axAbs > azAbs)  dominant = dx;
-    else if (ayAbs > azAbs)               dominant = dy;
-    else                                   dominant = dz;
+    else if (ayAbs > azAbs)              dominant = dy;
+    else                                 dominant = dz;
 
     // Increment counter on sign reversal; decay every sample
     if ((dominant >  SHAKE_REVERSAL_THRESH && prevDominant < -SHAKE_REVERSAL_THRESH) ||
@@ -429,7 +429,7 @@ static bool fetch_departures(char *err_buf, size_t err_len)
     int code = http.GET();
     serial_log("Fetch: HTTP %d\n", code);
     if (code != HTTP_CODE_OK) {
-        snprintf(err_buf, err_len, "HTTP %d from %s", code, cfg_station);
+        snprintf(err_buf, err_len, "Cannot fetch data for %s", cfg_station);
         http.end();
         return false;
     }
@@ -757,7 +757,7 @@ void setup()
             setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
             tzset();
         } else {
-            snprintf(reason, sizeof(reason), "No WiFi: %s pw:%d", cfg_ssid, (int)strlen(cfg_pass));
+            snprintf(reason, sizeof(reason), "No WiFi: %s", cfg_ssid);
             WiFi.mode(WIFI_AP_STA);
             delay(100);
             WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
