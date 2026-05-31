@@ -246,17 +246,13 @@ static State state = MANDATORY_CONFIG;
 #define IMU_SCL  18
 #define IMU_ADDR 0x6B
 
-// Shake = N direction reversals in Z within the window.
-// A reversal fires when dz crosses zero while |dz| exceeds the threshold.
-// This counts half-cycles of the shake oscillation, so it works even when the
-// reading stays elevated between peaks (the old spike-counting approach stalled
-// when a single shake burst lasted longer than the 200 ms minimum inter-spike gap).
-#define SHAKE_THRESHOLD_G        6.1f   // per-axis dynamic g to count a reversal
-#define REQUIRED_REVERSALS       3      // REQUIRED_REVERSALS / 2 full Z oscillation cycles
-#define REVERSAL_MIN_GAP_MS      80UL   // debounce: ignore reversals closer than this
-#define REVERSAL_MAX_GAP_MS      400UL  // max gap between reversals (≥ 2.5 Hz)
-#define WINDOW_MS                1000UL
-#define SHAKE_COOLDOWN_MS        3000UL
+#define SHAKE_ENERGY_ALPHA    0.80f   // EMA alpha for motion magnitude smoothing
+#define SHAKE_ENERGY_ENTER    8.0f   // enter shaking when smoothed energy exceeds this
+#define SHAKE_ENERGY_EXIT     3.5f   // exit shaking when energy drops below this
+#define SHAKE_REVERSAL_THRESH 2.0f   // dominant-axis threshold for sign reversal
+#define SHAKE_COUNT_ALPHA     0.92f  // per-sample decay factor for reversal counter
+#define SHAKE_COUNT_ENTER     2.5f   // min reversal count to confirm shaking
+#define SHAKE_COOLDOWN_MS     3000UL
 #define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
 #define WIFI_AP_SID "DepartBoard"
 #define WIFI_AP_PASS "t123"
@@ -266,16 +262,15 @@ static bool          imu_gravity_initialized   = false;
 static unsigned long optional_config_enter_ms  = 0;
 
 static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
-static const float   kAlpha   = 0.98f;
+static const float   kAlpha   = 0.95f;
 static unsigned long shake_cooldown_ms = 0;
-static float         dbg_magnitude     = 0.0f;
-static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dy = 0, dbg_dz = 0;
-static int           dbg_spikes        = 0;  // reversal count shown on debug strip
-static int8_t        shakeSignY        = 0;
-static int8_t        shakeSignZ        = 0;
-static int           reversalCount     = 0;
-static uint32_t      lastReversalMs    = 0;
-static uint32_t      windowStart       = 0;
+static float         dbg_energy        = 0.0f;
+static float         dbg_count         = 0.0f;
+static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dx = 0, dbg_dy = 0, dbg_dz = 0;
+static float         shakeEnergy       = 0.0f;
+static float         shakeCount        = 0.0f;
+static float         prevDominant      = 0.0f;
+static bool          shaking           = false;
 
 static bool imu_write_reg(uint8_t reg, uint8_t val)
 {
@@ -309,7 +304,7 @@ static void imu_init()
         Serial.printf("IMU: WHO_AM_I=0x%02X (expected 0x05)\n", who);
         return;
     }
-    imu_write_reg(0x03, 0x26);  // CTRL2: ACC ±8 g, 125 Hz
+    imu_write_reg(0x03, 0x26);  // CTRL2: ACC ±4 g, 125 Hz (bits[6:4]=001)
     imu_write_reg(0x08, 0x01);  // CTRL7: ACC enable
     imu_ok = true;
     Serial.println("IMU OK");
@@ -326,72 +321,62 @@ static bool IRAM_ATTR check_shake()
     int16_t rx = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
     int16_t ry = (int16_t)((uint16_t)buf[3] << 8 | buf[2]);
     int16_t rz = (int16_t)((uint16_t)buf[5] << 8 | buf[4]);
-    const float scale = 8.0f / 32768.0f;  // ±8 g, 16-bit
+    const float scale = 4.0f / 32768.0f;
     float ax = rx * scale, ay = ry * scale, az = rz * scale;
 
-    // Seed gravity to current orientation on first reading (avoids cold-start
-    // magnitude spike and the post-shake distortion: a hard shake drags the
-    // filter away from true gravity; if cooldown then blocks updates, the filter
-    // stays distorted and fires false spikes the moment cooldown expires).
     if (!imu_gravity_initialized) {
         gravityX = ax; gravityY = ay; gravityZ = az;
         imu_gravity_initialized = true;
         return false;
     }
 
-    // Always update — even during shake_cooldown — so the filter re-converges
-    // to true gravity while we wait and won't misfire when cooldown lifts.
+    // Slower LPF keeps shake energy in dx/dy/dz rather than absorbing it into gravity
     gravityX = kAlpha * gravityX + (1.0f - kAlpha) * ax;
     gravityY = kAlpha * gravityY + (1.0f - kAlpha) * ay;
     gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
 
+    float dx = ax - gravityX;
     float dy = ay - gravityY;
     float dz = az - gravityZ;
-    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dy = dy; dbg_dz = dz;
-    dbg_magnitude = fmaxf(fabsf(dy), fabsf(dz));
+    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dx = dx; dbg_dy = dy; dbg_dz = dz;
+
+    // Smoothed L1 motion magnitude
+    float motion = fabsf(dx) + fabsf(dy) + fabsf(dz);
+    shakeEnergy = shakeEnergy * SHAKE_ENERGY_ALPHA + motion * (1.0f - SHAKE_ENERGY_ALPHA);
+
+    // Dominant axis: whichever of dx/dy/dz has the largest absolute value
+    float axAbs = fabsf(dx), ayAbs = fabsf(dy), azAbs = fabsf(dz);
+    float dominant;
+    if (axAbs > ayAbs && axAbs > azAbs)  dominant = dx;
+    else if (ayAbs > azAbs)               dominant = dy;
+    else                                   dominant = dz;
+
+    // Increment counter on sign reversal; decay every sample
+    if ((dominant >  SHAKE_REVERSAL_THRESH && prevDominant < -SHAKE_REVERSAL_THRESH) ||
+        (dominant < -SHAKE_REVERSAL_THRESH && prevDominant >  SHAKE_REVERSAL_THRESH))
+    {
+        shakeCount += 1.0f;
+    }
+    prevDominant = dominant;
+    shakeCount  *= SHAKE_COUNT_ALPHA;
+
+    dbg_energy = shakeEnergy;
+    dbg_count  = shakeCount;
 
     uint32_t now = millis();
+    if (now < shake_cooldown_ms) return false;
 
-    if (now < shake_cooldown_ms) { dbg_spikes = reversalCount; return false; }
-
-    // Count a reversal on either Y or Z into the shared counter.
-    auto check_axis = [&](float d, int8_t &axisSign) {
-        int8_t sign = (d > SHAKE_THRESHOLD_G) ? 1 : (d < -SHAKE_THRESHOLD_G) ? -1 : 0;
-        if (sign != 0 && sign != axisSign) {
-            if (axisSign != 0) {
-                uint32_t gap = now - lastReversalMs;
-                if (gap >= REVERSAL_MIN_GAP_MS) {
-                    if (gap <= REVERSAL_MAX_GAP_MS) {
-                        if (reversalCount == 0) windowStart = now;
-                        reversalCount++;
-                    } else {
-                        reversalCount = 1;
-                        windowStart   = now;
-                    }
-                    lastReversalMs = now;
-                }
-            }
-            axisSign = sign;
-        } else if (sign == 0) {
-            axisSign = 0;
+    if (!shaking) {
+        if (shakeEnergy > SHAKE_ENERGY_ENTER && shakeCount > SHAKE_COUNT_ENTER) {
+            shaking           = true;
+            shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
+            return true;
         }
-    };
-    check_axis(dy, shakeSignY);
-    check_axis(dz, shakeSignZ);
-
-    // Expire window if it has gone stale.
-    if (reversalCount > 0 && now - windowStart > WINDOW_MS) reversalCount = 0;
-
-    dbg_spikes = reversalCount;
-
-    if (reversalCount >= REQUIRED_REVERSALS) {
-        reversalCount     = 0;
-        shakeSignY        = 0;
-        shakeSignZ        = 0;
-        shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
-        return true;
+    } else {
+        if (shakeEnergy < SHAKE_ENERGY_EXIT) {
+            shaking = false;
+        }
     }
-
     return false;
 }
 
@@ -420,10 +405,10 @@ static void serial_imu_debug()
     if (serial_dbg_anchored) Serial.print("\033[2A\r");
     serial_dbg_anchored = true;
     unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
-    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dy=%6.2f  dz=%6.2f\n",
-                  dbg_ax, dbg_ay, dbg_az, dbg_dy, dbg_dz);
-    Serial.printf("mag=%5.2f  rev=%d  cd=%lus                    \n",
-                  dbg_magnitude, dbg_spikes, cdwn);
+    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dx=%6.2f  dy=%6.2f  dz=%6.2f\n",
+                  dbg_ax, dbg_ay, dbg_az, dbg_dx, dbg_dy, dbg_dz);
+    Serial.printf("energy=%5.2f  count=%4.2f  cd=%lus%s\n",
+                  dbg_energy, dbg_count, cdwn, shaking ? " [SHAKING]" : "          ");
 }
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
