@@ -226,11 +226,12 @@ static State state = MANDATORY_CONFIG;
 // This counts half-cycles of the shake oscillation, so it works even when the
 // reading stays elevated between peaks (the old spike-counting approach stalled
 // when a single shake burst lasted longer than the 200 ms minimum inter-spike gap).
-#define SHAKE_THRESHOLD_G        1.5f   // per-axis dynamic g to count a reversal
-#define REQUIRED_REVERSALS       6      // 3 full Z oscillation cycles
+#define SHAKE_THRESHOLD_G        6.1f   // per-axis dynamic g to count a reversal
+#define REQUIRED_REVERSALS       3      // REQUIRED_REVERSALS / 2 full Z oscillation cycles
+#define REVERSAL_MIN_GAP_MS      80UL   // debounce: ignore reversals closer than this
 #define REVERSAL_MAX_GAP_MS      400UL  // max gap between reversals (≥ 2.5 Hz)
-#define WINDOW_MS                2000UL
-#define SHAKE_COOLDOWN_MS        2500UL
+#define WINDOW_MS                1000UL
+#define SHAKE_COOLDOWN_MS        3000UL
 #define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
 #define WIFI_AP_SID "DepartBoard"
 #define WIFI_AP_PASS "t123"
@@ -243,9 +244,10 @@ static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
 static const float   kAlpha   = 0.98f;
 static unsigned long shake_cooldown_ms = 0;
 static float         dbg_magnitude     = 0.0f;
-static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dz = 0;
+static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dy = 0, dbg_dz = 0;
 static int           dbg_spikes        = 0;  // reversal count shown on debug strip
-static int8_t        shakeSign         = 0;  // last sign of dz that crossed threshold
+static int8_t        shakeSignY        = 0;
+static int8_t        shakeSignZ        = 0;
 static int           reversalCount     = 0;
 static uint32_t      lastReversalMs    = 0;
 static uint32_t      windowStart       = 0;
@@ -318,35 +320,39 @@ static bool IRAM_ATTR check_shake()
     gravityY = kAlpha * gravityY + (1.0f - kAlpha) * ay;
     gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
 
+    float dy = ay - gravityY;
     float dz = az - gravityZ;
-    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dz = dz;
-    dbg_magnitude = fabsf(dz);
+    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dy = dy; dbg_dz = dz;
+    dbg_magnitude = fmaxf(fabsf(dy), fabsf(dz));
 
     uint32_t now = millis();
 
     if (now < shake_cooldown_ms) { dbg_spikes = reversalCount; return false; }
 
-    // Detect a direction reversal: dz crossed zero while above the threshold.
-    // Each half-cycle of a deliberate shake produces exactly one reversal,
-    // regardless of how long the reading stays elevated within that half-cycle.
-    int8_t sign = (dz > SHAKE_THRESHOLD_G) ? 1 : (dz < -SHAKE_THRESHOLD_G) ? -1 : 0;
-    if (sign != 0 && sign != shakeSign) {
-        if (shakeSign != 0) {
-            // Crossed from one side to the other — count it.
-            if (now - lastReversalMs <= REVERSAL_MAX_GAP_MS) {
-                if (reversalCount == 0) windowStart = now;
-                reversalCount++;
-            } else {
-                // Gap too long — restart the window with this reversal.
-                reversalCount = 1;
-                windowStart   = now;
+    // Count a reversal on either Y or Z into the shared counter.
+    auto check_axis = [&](float d, int8_t &axisSign) {
+        int8_t sign = (d > SHAKE_THRESHOLD_G) ? 1 : (d < -SHAKE_THRESHOLD_G) ? -1 : 0;
+        if (sign != 0 && sign != axisSign) {
+            if (axisSign != 0) {
+                uint32_t gap = now - lastReversalMs;
+                if (gap >= REVERSAL_MIN_GAP_MS) {
+                    if (gap <= REVERSAL_MAX_GAP_MS) {
+                        if (reversalCount == 0) windowStart = now;
+                        reversalCount++;
+                    } else {
+                        reversalCount = 1;
+                        windowStart   = now;
+                    }
+                    lastReversalMs = now;
+                }
             }
-            lastReversalMs = now;
+            axisSign = sign;
+        } else if (sign == 0) {
+            axisSign = 0;
         }
-        shakeSign = sign;
-    } else if (sign == 0) {
-        shakeSign = 0;  // dz fell back inside the dead-band; allow re-arm
-    }
+    };
+    check_axis(dy, shakeSignY);
+    check_axis(dz, shakeSignZ);
 
     // Expire window if it has gone stale.
     if (reversalCount > 0 && now - windowStart > WINDOW_MS) reversalCount = 0;
@@ -355,7 +361,8 @@ static bool IRAM_ATTR check_shake()
 
     if (reversalCount >= REQUIRED_REVERSALS) {
         reversalCount     = 0;
-        shakeSign         = 0;
+        shakeSignY        = 0;
+        shakeSignZ        = 0;
         shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
         return true;
     }
@@ -391,9 +398,9 @@ static void serial_imu_debug()
     if (serial_dbg_anchored) Serial.print("\033[2A\r");
     serial_dbg_anchored = true;
     unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
-    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dz=%6.2f\n",
-                  dbg_ax, dbg_ay, dbg_az, dbg_dz);
-    Serial.printf("mag=%5.2f  rev=%d  cd=%lus          \n",
+    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dy=%6.2f  dz=%6.2f\n",
+                  dbg_ax, dbg_ay, dbg_az, dbg_dy, dbg_dz);
+    Serial.printf("mag=%5.2f  rev=%d  cd=%lus                    \n",
                   dbg_magnitude, dbg_spikes, cdwn);
 }
 
