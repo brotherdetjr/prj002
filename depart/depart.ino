@@ -15,6 +15,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <nvs_flash.h>
 #include <WebServer.h>
 #include <time.h>
 #include <sys/time.h>
@@ -152,6 +153,16 @@ static char cfg_station[8] = "MZH";
 static char api_url[72]    = "";
 static unsigned long imu_ready_at_ms = 0;
 
+// RTC_NOINIT_ATTR: startup code never re-initialises this section, so values
+// survive esp_restart() (unlike RTC_DATA_ATTR which is re-copied from flash
+// on every non-deep-sleep boot).  Magic number guards against stale data on
+// a true power-on reset.
+#define RTC_SAVE_MAGIC 0xCAFED00D
+RTC_NOINIT_ATTR static uint32_t rtc_magic;
+RTC_NOINIT_ATTR static char     rtc_ssid[64];
+RTC_NOINIT_ATTR static char     rtc_pass[64];
+RTC_NOINIT_ATTR static char     rtc_station[8];
+
 static void load_config()
 {
     Preferences prefs;
@@ -168,19 +179,29 @@ static void load_config()
         "https://national-rail-api.davwheat.dev/departures/%s", cfg_station);
 }
 
+static bool nvs_open_rw(Preferences &prefs)
+{
+    if (prefs.begin("depart", false)) return true;
+    // NVS is corrupted (likely from a crash-interrupted write).  Erase the
+    // whole partition and reinitialise before retrying.
+    Serial.println("NVS open failed — erasing partition and retrying");
+    nvs_flash_erase();
+    nvs_flash_init();
+    return prefs.begin("depart", false);
+}
+
 static void save_config()
 {
-    imu_ready_at_ms = millis() + 5000;  // NVS erase+write may disable cache for tens of ms
     Preferences prefs;
-    bool ok = prefs.begin("depart", false);
-    serial_log("Prefs save: begin=%d\n", ok);
-    if (ok) {
-        prefs.putString("ssid",    cfg_ssid);
-        prefs.putString("pass",    cfg_pass);
-        prefs.putString("station", cfg_station);
-        prefs.end();
-        serial_log("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
+    if (!nvs_open_rw(prefs)) {
+        Serial.println("Prefs save: failed to open namespace");
+        return;
     }
+    prefs.putString("ssid",    cfg_ssid);
+    prefs.putString("pass",    cfg_pass);
+    prefs.putString("station", cfg_station);
+    prefs.end();
+    Serial.printf("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
 }
 
 // ── Departure data ────────────────────────────────────────────────────────────
@@ -643,22 +664,18 @@ static void portal_start()
         server.send(200, "text/html; charset=utf-8", html);
     });
     server.on("/save", HTTP_POST, []() {
-        if (server.hasArg("ssid"))    server.arg("ssid").toCharArray(cfg_ssid, sizeof(cfg_ssid));
-        if (server.hasArg("pass"))    server.arg("pass").toCharArray(cfg_pass, sizeof(cfg_pass));
+        if (server.hasArg("ssid"))    server.arg("ssid").toCharArray(rtc_ssid, sizeof(rtc_ssid));
+        if (server.hasArg("pass"))    server.arg("pass").toCharArray(rtc_pass, sizeof(rtc_pass));
         if (server.hasArg("station")) {
             String s = server.arg("station");
             s.toUpperCase();
-            s.toCharArray(cfg_station, sizeof(cfg_station));
+            s.toCharArray(rtc_station, sizeof(rtc_station));
         }
-        save_config();
-        server.sendHeader("Location", "/restarting");
-        server.send(303, "text/plain", "");
-    });
-    server.on("/restarting", []() {
+        rtc_magic     = RTC_SAVE_MAGIC;
+        restart_at_ms = millis() + 1000;
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "text/html",
             "<html><body><h1>Saved!</h1><p>Restarting...</p></body></html>");
-        restart_at_ms = millis() + 1000;
     });
     server.begin();
     portal_active = true;
@@ -708,6 +725,20 @@ static unsigned long serial_dbg_ms   = 0;
 void setup()
 {
     Serial.begin(115200);
+
+    // Deferred NVS write from the previous boot's config save.
+    // Done here, before any peripheral is initialised, so no ISR can access
+    // cached memory (PSRAM/DROM) while the flash cache is briefly disabled.
+    bool save_pending = (rtc_magic == RTC_SAVE_MAGIC);
+    Serial.printf("RTC save pending=%d station='%s'\n", save_pending, save_pending ? rtc_station : "");
+    if (save_pending) {
+        rtc_magic = 0;
+        strlcpy(cfg_ssid,    rtc_ssid,    sizeof(cfg_ssid));
+        strlcpy(cfg_pass,    rtc_pass,    sizeof(cfg_pass));
+        strlcpy(cfg_station, rtc_station, sizeof(cfg_station));
+        save_config();
+    }
+
     load_config();
     imu_init();  // must be before WiFi — Wire.begin() after WiFi+LCD causes a cache panic
 
@@ -784,7 +815,10 @@ void loop()
 {
     if (portal_active) server.handleClient();
 
-    if (restart_at_ms && millis() >= restart_at_ms) ESP.restart();
+    if (restart_at_ms && millis() >= restart_at_ms) {
+        portal_stop();
+        ESP.restart();
+    }
 
     bool shook = check_shake();
 
