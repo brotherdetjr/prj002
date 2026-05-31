@@ -126,13 +126,15 @@ Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
 
 // ── Screen log ───────────────────────────────────────────────────────────────
 
+#define X_TIME 10  // left margin (px); shared with departure board layout
+
 static int slog_y = 0;
 
-static void slog(const char *msg)
+static void slog(const char *msg, uint16_t color = WHITE)
 {
     gfx->setTextSize(3);
-    gfx->setTextColor(WHITE);
-    gfx->setCursor(4, slog_y);
+    gfx->setTextColor(color);
+    gfx->setCursor(X_TIME, slog_y);
     gfx->print(msg);
     slog_y += 25;
 }
@@ -187,7 +189,6 @@ static void save_config()
 //   DEST    left  x=116  (up to ~37 ch before PLAT, truncated in struct)
 //   PLAT    right r=620
 //   STATUS  right r=810  (820 - 10 margin)
-#define X_TIME    10
 #define X_DEST   116
 #define R_PLAT   620   // right edge of PLAT column
 #define R_STATUS 810   // right edge of STATUS column
@@ -565,8 +566,8 @@ static void draw_mandatory_config(const char *reason)
 {
     serial_log("Screen: mandatory config (%s)\n", reason);
     gfx->fillScreen(BLACK);
-    slog_y = 0;
-    slog("! CONFIG REQUIRED !");
+    slog_y = X_TIME;
+    slog("CONFIG REQUIRED!", RED);
     slog(reason);
     slog("");
     slog("Connect to WiFi:");
@@ -582,7 +583,8 @@ static void draw_optional_config()
 {
     serial_log("Screen: optional config\n");
     gfx->fillScreen(BLACK);
-    slog_y = 0;
+    slog_y = X_TIME;
+    slog("CONFIG MODE", YELLOW);
     slog("Connect to WiFi:");
     char creds[32] = "";
     snprintf(creds, sizeof(creds), "  %s / %s", WIFI_AP_SID, WIFI_AP_PASS);
