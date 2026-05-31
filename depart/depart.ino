@@ -19,6 +19,7 @@
 #include <WebServer.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_sntp.h>
 
 #define BLACK   RGB565_BLACK
 #define WHITE   RGB565_WHITE
@@ -222,7 +223,7 @@ static void save_config()
 #define HDR_H  52   // header section height (px)
 #define ROW_H  38   // height of each table row (px)
 
-#define MAX_DEPARTURES 5
+#define MAX_DEPARTURES 6
 
 struct Departure {
     char time[6];         // "HH:MM"
@@ -260,6 +261,7 @@ static State state = MANDATORY_CONFIG;
 static bool          imu_ok                    = false;
 static bool          imu_gravity_initialized   = false;
 static unsigned long optional_config_enter_ms  = 0;
+static unsigned long last_mandatory_retry_ms   = 0;
 
 static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
 static const float   kAlpha   = 0.95f;
@@ -413,7 +415,7 @@ static void serial_imu_debug()
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-static bool fetch_departures(char *err_buf, size_t err_len)
+static bool fetch_departures_once(char *err_buf, size_t err_len)
 {
     serial_log("Fetch: %s\n", api_url);
     WiFiClientSecure client;
@@ -481,6 +483,19 @@ static bool fetch_departures(char *err_buf, size_t err_len)
         N++;
     }
     return true;
+}
+
+static const unsigned long FETCH_RETRY_DELAYS_MS[] = { 1000, 5000, 10000 };
+
+static bool fetch_departures(char *err_buf, size_t err_len)
+{
+    if (fetch_departures_once(err_buf, err_len)) return true;
+    for (int i = 0; i < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
+        serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
+        delay(FETCH_RETRY_DELAYS_MS[i]);
+        if (fetch_departures_once(err_buf, err_len)) return true;
+    }
+    return false;
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
@@ -685,6 +700,7 @@ static void enter_mandatory_config(const char *reason)
     WiFi.mode(WIFI_AP_STA);
     delay(100);
     WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+    last_mandatory_retry_ms = millis();
     draw_mandatory_config(reason);
     portal_start();
     state = MANDATORY_CONFIG;
@@ -701,6 +717,19 @@ static void enter_optional_config()
     portal_start();
     optional_config_enter_ms = millis();
     state = OPTIONAL_CONFIG;
+}
+
+static volatile bool ntp_synced = false;
+
+static void on_ntp_sync(struct timeval *) { ntp_synced = true; }
+
+static void sync_time()
+{
+    configTime(0, 0, "pool.ntp.org");
+    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+    tzset();
+    esp_sntp_set_time_sync_notification_cb(on_ntp_sync);
+    esp_sntp_set_sync_interval(10000);
 }
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
@@ -753,9 +782,7 @@ void setup()
         if (WiFi.status() == WL_CONNECTED) {
             wifi_ok = true;
             Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
-            configTime(0, 0, "pool.ntp.org");
-            setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
-            tzset();
+            sync_time();
         } else {
             snprintf(reason, sizeof(reason), "No WiFi: %s", cfg_ssid);
             WiFi.mode(WIFI_AP_STA);
@@ -814,6 +841,11 @@ void loop()
             enter_optional_config();
             break;
         }
+        if (ntp_synced) {
+            ntp_synced = false;
+            gfx->fillScreen(BLACK);
+            draw_board();
+        }
         unsigned long now = millis();
         if (now - last_fetch >= REFRESH_MS) {
             last_fetch = now;
@@ -847,7 +879,20 @@ void loop()
         break;
     }
     case MANDATORY_CONFIG:
-        // Portal handled above; nothing else to do here.
+        if (cfg_ssid[0] != '\0' && millis() - last_mandatory_retry_ms >= 10000) {
+            last_mandatory_retry_ms = millis();
+            char err[64] = "";
+            if (fetch_departures_once(err, sizeof(err))) {
+                portal_stop();
+                imu_ready_at_ms = millis() + 2000;  // softAPdisconnect may write NVS
+                WiFi.softAPdisconnect(true);
+                sync_time();
+                last_fetch = millis();
+                state = WORKING;
+                gfx->fillScreen(BLACK);
+                draw_board();
+            }
+        }
         break;
     }
 
