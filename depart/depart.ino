@@ -117,7 +117,7 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
     10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 20 /* vsync_back_porch */,
     0 /* pclk_active_neg */, GFX_NOT_DEFINED /* prefer_speed */,
     false /* useBigEndian */, 0 /* de_idle_high */, 0 /* pclk_idle_high */,
-    320 * 10 /* bounce_buffer_size_px */);
+    820 * 10 /* bounce_buffer_size_px */);
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
     320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
@@ -565,6 +565,7 @@ static void draw_board()
         gfx->drawFastHLine(0, y + ROW_H - 1, W, divider);
         y += ROW_H;
     }
+    if (y < H) gfx->fillRect(0, y, W, H - y, BLACK);
     gfx->flush(true);
 }
 
