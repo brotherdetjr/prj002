@@ -802,15 +802,18 @@ void loop()
         bool timed_out = (millis() - optional_config_enter_ms >= OPTIONAL_CONFIG_TIMEOUT_MS);
         if (shook || timed_out) {
             portal_stop();
-            char err[64] = "";
-            if (fetch_departures(err, sizeof(err))) {
-                last_fetch = millis();
-                state = WORKING;
-                gfx->fillScreen(BLACK);
-                draw_board();
-            } else {
-                enter_mandatory_config(err);
+            unsigned long now = millis();
+            if (now - last_fetch >= REFRESH_MS) {
+                char err[64] = "";
+                if (!fetch_departures(err, sizeof(err))) {
+                    enter_mandatory_config(err);
+                    break;
+                }
+                last_fetch = now;
             }
+            state = WORKING;
+            gfx->fillScreen(BLACK);
+            draw_board();
         }
         break;
     }
