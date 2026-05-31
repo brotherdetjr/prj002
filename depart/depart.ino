@@ -482,17 +482,6 @@ static bool fetch_departures_once(char *err_buf, size_t err_len)
 
 static const unsigned long FETCH_RETRY_DELAYS_MS[] = { 1000, 5000, 10000 };
 
-static bool fetch_departures(char *err_buf, size_t err_len)
-{
-    if (fetch_departures_once(err_buf, err_len)) return true;
-    for (int i = 0; i < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
-        serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
-        delay(FETCH_RETRY_DELAYS_MS[i]);
-        if (fetch_departures_once(err_buf, err_len)) return true;
-    }
-    return false;
-}
-
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
 static void draw_board()
@@ -648,12 +637,15 @@ static const char CONFIG_HTML[] =
     "</form></body></html>";
 
 static WebServer     server(80);
-static bool          portal_active   = false;
-static unsigned long restart_at_ms   = 0;
+static bool          portal_active = false;
+static unsigned long restart_at_ms = 0;
 
-static void portal_start()
+// Called once from setup() before WiFi init so the socket is bound to
+// 0.0.0.0:80 while the lwIP stack is in its default clean state.  Once
+// bound, the server accepts connections from any interface (STA or AP)
+// that lwIP adds later.
+static void portal_server_init()
 {
-    if (portal_active) return;
     server.on("/", HTTP_GET, []() {
         String html = CONFIG_HTML;
         html.replace("%SSID%", cfg_ssid);
@@ -670,21 +662,16 @@ static void portal_start()
             s.toCharArray(rtc_station, sizeof(rtc_station));
         }
         rtc_magic     = RTC_SAVE_MAGIC;
-        restart_at_ms = millis() + 1000;
+        restart_at_ms = millis() + 2000;
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "text/html",
             "<html><body><h1>Saved!</h1><p>Restarting...</p></body></html>");
     });
     server.begin();
-    portal_active = true;
 }
 
-static void portal_stop()
-{
-    if (!portal_active) return;
-    server.stop();
-    portal_active = false;
-}
+static void portal_start() { portal_active = true; }
+static void portal_stop()  { portal_active = false; }
 
 // ── State transitions ─────────────────────────────────────────────────────────
 
@@ -697,6 +684,14 @@ static void enter_mandatory_config(const char *reason)
     WiFi.mode(WIFI_AP_STA);
     delay(100);
     WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+    // After softAPdisconnect(true) the AP config is cleared; the mode change
+    // restarts the AP interface asynchronously.  Poll until 192.168.4.1 is
+    // assigned (proof the AP is truly up) rather than relying on a fixed delay.
+    {
+        unsigned long t0 = millis();
+        while ((uint32_t)WiFi.softAPIP() == 0 && millis() - t0 < 3000) delay(50);
+        serial_log("AP IP: %s (%lums)\n", WiFi.softAPIP().toString().c_str(), millis() - t0);
+    }
     last_mandatory_retry_ms = millis();
     draw_mandatory_config(reason);
     portal_start();
@@ -731,8 +726,11 @@ static void sync_time()
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
 
-static unsigned long last_fetch      = 0;
-static unsigned long serial_dbg_ms   = 0;
+static unsigned long last_fetch        = 0;
+static unsigned long serial_dbg_ms    = 0;
+static int           fetch_retry_idx  = -1;   // -1 = idle; 0..N-1 = retry pending
+static unsigned long fetch_retry_at_ms = 0;
+static char          fetch_err[64]    = "";
 
 void setup()
 {
@@ -788,6 +786,10 @@ void setup()
         }
     }
 
+    // Bind the web server socket here — after WiFi init so the lwIP stack
+    // and its semaphores exist, but before any portal_start() call.
+    portal_server_init();
+
     // Display init (always after WiFi)
     pinMode(GFX_BL, OUTPUT);
     digitalWrite(GFX_BL, LOW);  // LOW = ON (NPN transistor)
@@ -805,7 +807,13 @@ void setup()
     }
 
     char err[64] = "";
-    if (!fetch_departures(err, sizeof(err))) {
+    bool fetch_ok = fetch_departures_once(err, sizeof(err));
+    for (int i = 0; !fetch_ok && i < (int)(sizeof(FETCH_RETRY_DELAYS_MS)/sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
+        serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
+        delay(FETCH_RETRY_DELAYS_MS[i]);
+        fetch_ok = fetch_departures_once(err, sizeof(err));
+    }
+    if (!fetch_ok) {
         // WiFi connected but fetch failed — switch to AP and show config screen.
         WiFi.mode(WIFI_AP_STA);
         delay(100);
@@ -826,8 +834,7 @@ void loop()
     if (portal_active) server.handleClient();
 
     if (restart_at_ms && millis() >= restart_at_ms) {
-        portal_stop();
-        ESP.restart();
+        ESP.restart();  // no portal_stop() — don't close the socket before restart
     }
 
     bool shook = check_shake();
@@ -850,14 +857,36 @@ void loop()
             }
         }
         unsigned long now = millis();
-        if (now - last_fetch >= REFRESH_MS) {
+        if (fetch_retry_idx < 0 && now - last_fetch >= REFRESH_MS) {
             last_fetch = now;
             char err[64] = "";
-            if (fetch_departures(err, sizeof(err))) {
+            if (fetch_departures_once(err, sizeof(err))) {
                 gfx->fillScreen(BLACK);
                 draw_board();
             } else {
-                enter_mandatory_config(err);
+                strlcpy(fetch_err, err, sizeof(fetch_err));
+                fetch_retry_idx   = 0;
+                fetch_retry_at_ms = now + FETCH_RETRY_DELAYS_MS[0];
+                serial_log("Fetch: retry 1 in %lus\n", FETCH_RETRY_DELAYS_MS[0] / 1000);
+            }
+        }
+        if (fetch_retry_idx >= 0 && now >= fetch_retry_at_ms) {
+            char err[64] = "";
+            if (fetch_departures_once(err, sizeof(err))) {
+                fetch_retry_idx = -1;
+                gfx->fillScreen(BLACK);
+                draw_board();
+            } else {
+                strlcpy(fetch_err, err, sizeof(fetch_err));
+                int next = fetch_retry_idx + 1;
+                if (next < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0]))) {
+                    serial_log("Fetch: retry %d in %lus\n", next + 1, FETCH_RETRY_DELAYS_MS[next] / 1000);
+                    fetch_retry_idx   = next;
+                    fetch_retry_at_ms = now + FETCH_RETRY_DELAYS_MS[next];
+                } else {
+                    fetch_retry_idx = -1;
+                    enter_mandatory_config(fetch_err);
+                }
             }
         }
         break;
@@ -869,11 +898,12 @@ void loop()
             unsigned long now = millis();
             if (now - last_fetch >= REFRESH_MS) {
                 char err[64] = "";
-                if (!fetch_departures(err, sizeof(err))) {
+                if (!fetch_departures_once(err, sizeof(err))) {
                     enter_mandatory_config(err);
                     break;
                 }
                 last_fetch = now;
+                fetch_retry_idx = -1;
             }
             state = WORKING;
             gfx->fillScreen(BLACK);
@@ -884,16 +914,32 @@ void loop()
     case MANDATORY_CONFIG:
         if (cfg_ssid[0] != '\0' && millis() - last_mandatory_retry_ms >= 10000) {
             last_mandatory_retry_ms = millis();
-            char err[64] = "";
-            if (fetch_departures_once(err, sizeof(err))) {
-                portal_stop();
-                imu_ready_at_ms = millis() + 2000;  // softAPdisconnect may write NVS
-                WiFi.softAPdisconnect(true);
-                sync_time();
-                last_fetch = millis();
-                state = WORKING;
-                gfx->fillScreen(BLACK);
-                draw_board();
+            if (WiFi.status() != WL_CONNECTED) {
+                serial_log("MANDATORY_CONFIG: reconnecting to %s\n", cfg_ssid);
+                // reconnect() reuses STA credentials from the driver; they survive
+                // the disconnect(false)+mode-change in enter_mandatory_config.
+                WiFi.reconnect();
+                unsigned long t0 = millis();
+                while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+                    if (portal_active) server.handleClient();
+                    delay(200);
+                }
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                char err[64] = "";
+                if (fetch_departures_once(err, sizeof(err))) {
+                    // WiFi is back.  Don't kill the AP — the user may be on
+                    // the config page right now.  Promote to OPTIONAL_CONFIG
+                    // which keeps the portal alive and auto-exits in 5 min.
+                    imu_ready_at_ms = millis() + 2000;
+                    sync_time();
+                    last_fetch      = millis();
+                    fetch_retry_idx = -1;
+                    optional_config_enter_ms = millis();
+                    state = OPTIONAL_CONFIG;
+                    gfx->fillScreen(BLACK);
+                    draw_optional_config();
+                }
             }
         }
         break;
