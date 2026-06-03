@@ -410,7 +410,7 @@ static void serial_imu_debug()
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-static bool fetch_departures_once(char *err_buf, size_t err_len)
+static bool fetch_departures(char *err_buf, size_t err_len)
 {
     serial_log("Fetch: %s\n", api_url);
     WiFiClientSecure client;
@@ -807,11 +807,11 @@ void setup()
     }
 
     char err[64] = "";
-    bool fetch_ok = fetch_departures_once(err, sizeof(err));
+    bool fetch_ok = fetch_departures(err, sizeof(err));
     for (int i = 0; !fetch_ok && i < (int)(sizeof(FETCH_RETRY_DELAYS_MS)/sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
         serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
         delay(FETCH_RETRY_DELAYS_MS[i]);
-        fetch_ok = fetch_departures_once(err, sizeof(err));
+        fetch_ok = fetch_departures(err, sizeof(err));
     }
     if (!fetch_ok) {
         // WiFi connected but fetch failed — switch to AP and show config screen.
@@ -860,7 +860,7 @@ void loop()
         if (fetch_retry_idx < 0 && now - last_fetch >= REFRESH_MS) {
             last_fetch = now;
             char err[64] = "";
-            if (fetch_departures_once(err, sizeof(err))) {
+            if (fetch_departures(err, sizeof(err))) {
                 gfx->fillScreen(BLACK);
                 draw_board();
             } else {
@@ -872,7 +872,7 @@ void loop()
         }
         if (fetch_retry_idx >= 0 && now >= fetch_retry_at_ms) {
             char err[64] = "";
-            if (fetch_departures_once(err, sizeof(err))) {
+            if (fetch_departures(err, sizeof(err))) {
                 fetch_retry_idx = -1;
                 gfx->fillScreen(BLACK);
                 draw_board();
@@ -898,7 +898,7 @@ void loop()
             unsigned long now = millis();
             if (now - last_fetch >= REFRESH_MS) {
                 char err[64] = "";
-                if (!fetch_departures_once(err, sizeof(err))) {
+                if (!fetch_departures(err, sizeof(err))) {
                     enter_mandatory_config(err);
                     break;
                 }
@@ -927,7 +927,7 @@ void loop()
             }
             if (WiFi.status() == WL_CONNECTED) {
                 char err[64] = "";
-                if (fetch_departures_once(err, sizeof(err))) {
+                if (fetch_departures(err, sizeof(err))) {
                     // WiFi is back.  Don't kill the AP — the user may be on
                     // the config page right now.  Promote to OPTIONAL_CONFIG
                     // which keeps the portal alive and auto-exits in 5 min.
