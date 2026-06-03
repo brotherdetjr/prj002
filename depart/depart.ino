@@ -678,7 +678,6 @@ static void portal_stop()  { portal_active = false; }
 // Draws the error screen and starts the portal.  AP is always up since setup().
 static void enter_mandatory_config(const char *reason)
 {
-    portal_stop();
     last_mandatory_retry_ms = millis();
     draw_mandatory_config(reason);
     portal_start();
