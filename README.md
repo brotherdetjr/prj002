@@ -76,6 +76,7 @@ pip3 install esptool --break-system-packages
 ./upload.sh           # backup current firmware, compile, flash
 ./upload.sh --no-backup   # skip backup
 ./upload.sh --debug       # open serial monitor after flashing
+./debug.sh            # open serial monitor without flashing
 ```
 
 ### Shake data logger
