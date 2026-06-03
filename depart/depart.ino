@@ -928,17 +928,14 @@ void loop()
             if (WiFi.status() == WL_CONNECTED) {
                 char err[64] = "";
                 if (fetch_departures(err, sizeof(err))) {
-                    // WiFi is back.  Don't kill the AP — the user may be on
-                    // the config page right now.  Promote to OPTIONAL_CONFIG
-                    // which keeps the portal alive and auto-exits in 5 min.
                     imu_ready_at_ms = millis() + 2000;
                     sync_time();
                     last_fetch      = millis();
                     fetch_retry_idx = -1;
-                    optional_config_enter_ms = millis();
-                    state = OPTIONAL_CONFIG;
+                    portal_stop();
+                    state = WORKING;
                     gfx->fillScreen(BLACK);
-                    draw_optional_config();
+                    draw_board();
                 }
             }
         }
