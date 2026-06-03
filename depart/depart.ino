@@ -126,6 +126,18 @@ Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
     bus, GFX_NOT_DEFINED /* RST */,
     mf_st7701_init, sizeof(mf_st7701_init));
 
+// Double-buffered drawing target: canvas renders off-screen, flush() pushes atomically.
+// Falls back to gfx if PSRAM allocation fails.
+static Arduino_Canvas *canvas = nullptr;
+static Arduino_GFX    *screen = nullptr;
+static void screen_flush() {
+    // Canvas uses physical portrait dimensions with rotation=1, so its buffer
+    // layout matches gfx's framebuffer exactly — a memcpy suffices, no rotation.
+    if (canvas)
+        memcpy(gfx->getFramebuffer(), canvas->getFramebuffer(), 320 * 820 * 2);
+    gfx->flush(true);
+}
+
 // ── Screen log ───────────────────────────────────────────────────────────────
 
 #define X_TIME 10  // left margin (px); shared with departure board layout
@@ -134,10 +146,10 @@ static int slog_y = 0;
 
 static void slog(const char *msg, uint16_t color = WHITE)
 {
-    gfx->setTextSize(3);
-    gfx->setTextColor(color);
-    gfx->setCursor(X_TIME, slog_y);
-    gfx->print(msg);
+    screen->setTextSize(3);
+    screen->setTextColor(color);
+    screen->setCursor(X_TIME, slog_y);
+    screen->print(msg);
     slog_y += 25;
 }
 
@@ -410,27 +422,46 @@ static void serial_imu_debug()
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-static bool fetch_departures(char *err_buf, size_t err_len)
+struct FetchResult {
+    bool     ok;
+    char     err[64];
+    Departure deps[MAX_DEPARTURES];
+    int      n;
+    char     station[32];
+};
+
+static QueueHandle_t fetch_queue        = nullptr;
+static TaskHandle_t  fetch_task_handle  = nullptr;
+static volatile bool fetch_in_progress  = false;
+static FetchResult   fetch_staging;
+
+static const unsigned long FETCH_RETRY_DELAYS_MS[] = { 1000, 5000, 10000 };
+
+static void do_fetch()
 {
+    FetchResult &out = fetch_staging;
     serial_log("Fetch: %s\n", api_url);
+    out.ok        = false;
+    out.n         = 0;
+    out.station[0] = '\0';
+    out.err[0]    = '\0';
+
     WiFiClientSecure client;
     // Skips certificate verification — fine for a local hobby device.
     client.setInsecure();
 
     HTTPClient http;
-    http.setTimeout(2000);
-    http.setConnectTimeout(2000);
     if (!http.begin(client, api_url)) {
-        strlcpy(err_buf, "HTTP begin failed", err_len);
-        return false;
+        strlcpy(out.err, "HTTP begin failed", sizeof(out.err));
+        return;
     }
 
     int code = http.GET();
     serial_log("Fetch: HTTP %d\n", code);
     if (code != HTTP_CODE_OK) {
-        snprintf(err_buf, err_len, "Cannot fetch data for %s", cfg_station);
+        snprintf(out.err, sizeof(out.err), "Cannot fetch data for %s", cfg_station);
         http.end();
-        return false;
+        return;
     }
 
     String body = http.getString();
@@ -439,50 +470,82 @@ static bool fetch_departures(char *err_buf, size_t err_len)
     JsonDocument doc;
     DeserializationError jerr = deserializeJson(doc, body);
     if (jerr) {
-        snprintf(err_buf, err_len, "JSON err: %s", jerr.c_str());
-        return false;
+        snprintf(out.err, sizeof(out.err), "JSON err: %s", jerr.c_str());
+        return;
     }
 
-    strlcpy(station_name, doc["locationName"] | cfg_station, sizeof(station_name));
+    strlcpy(out.station, doc["locationName"] | cfg_station, sizeof(out.station));
 
     // Prefer train services; fall back to bus replacements when trains are absent.
     JsonArray services = doc["trainServices"];
     if (services.isNull()) services = doc["busServices"];
 
-    N = 0;
-    if (services.isNull()) return true;
+    out.n = 0;
+    if (!services.isNull()) {
+        for (JsonObject svc : services) {
+            if (out.n >= MAX_DEPARTURES) break;
+            Departure &d = out.deps[out.n];
 
-    for (JsonObject svc : services) {
-        if (N >= MAX_DEPARTURES) break;
-        Departure &d = board[N];
+            strlcpy(d.time, svc["std"] | "--:--", sizeof(d.time));
 
-        strlcpy(d.time, svc["std"] | "--:--", sizeof(d.time));
+            const char *loc = svc["destination"][0]["locationName"] | "Unknown";
+            strlcpy(d.destination, loc, sizeof(d.destination));
 
-        const char *loc = svc["destination"][0]["locationName"] | "Unknown";
-        strlcpy(d.destination, loc, sizeof(d.destination));
+            // Buses often have null platform; show "BUS" as a fallback.
+            const char *plat = svc["platform"] | "BUS";
+            strlcpy(d.platform, plat, sizeof(d.platform));
 
-        // Buses often have null platform; show "BUS" as a fallback.
-        const char *plat = svc["platform"] | "BUS";
-        strlcpy(d.platform, plat, sizeof(d.platform));
+            bool cancelled = svc["isCancelled"] | false;
+            const char *etd = svc["etd"] | "";
+            if (cancelled || strcasecmp(etd, "cancelled") == 0) {
+                strlcpy(d.status, "Cancelled", sizeof(d.status));
+            } else if (strcasecmp(etd, "on time") == 0 || *etd == '\0') {
+                strlcpy(d.status, "On time", sizeof(d.status));
+            } else if (strcasecmp(etd, "delayed") == 0 || strcasecmp(etd, "no report") == 0) {
+                strlcpy(d.status, "Delayed", sizeof(d.status));
+            } else {
+                snprintf(d.status, sizeof(d.status), "Exp %s", etd);
+            }
 
-        bool cancelled = svc["isCancelled"] | false;
-        const char *etd = svc["etd"] | "";
-        if (cancelled || strcasecmp(etd, "cancelled") == 0) {
-            strlcpy(d.status, "Cancelled", sizeof(d.status));
-        } else if (strcasecmp(etd, "on time") == 0 || *etd == '\0') {
-            strlcpy(d.status, "On time", sizeof(d.status));
-        } else if (strcasecmp(etd, "delayed") == 0 || strcasecmp(etd, "no report") == 0) {
-            strlcpy(d.status, "Delayed", sizeof(d.status));
-        } else {
-            snprintf(d.status, sizeof(d.status), "Exp %s", etd);
+            out.n++;
         }
-
-        N++;
     }
-    return true;
+    out.ok = true;
 }
 
-static const unsigned long FETCH_RETRY_DELAYS_MS[] = { 1000, 5000, 10000 };
+// Synchronous wrapper used in setup() and config-transition paths.
+static bool fetch_departures(char *err_buf, size_t err_len)
+{
+    do_fetch();
+    if (fetch_staging.ok) {
+        memcpy(board, fetch_staging.deps, fetch_staging.n * sizeof(Departure));
+        N = fetch_staging.n;
+        strlcpy(station_name, fetch_staging.station, sizeof(station_name));
+    } else if (err_buf) {
+        strlcpy(err_buf, fetch_staging.err, err_len);
+    }
+    return fetch_staging.ok;
+}
+
+static void fetch_task_fn(void *)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        do_fetch();
+        for (int i = 0; !fetch_staging.ok && i < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
+            serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
+            vTaskDelay(pdMS_TO_TICKS(FETCH_RETRY_DELAYS_MS[i]));
+            do_fetch();
+        }
+        xQueueOverwrite(fetch_queue, &fetch_staging);
+    }
+}
+
+static void kick_fetch()
+{
+    fetch_in_progress = true;
+    xTaskNotifyGive(fetch_task_handle);
+}
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
@@ -493,13 +556,13 @@ static void draw_board()
     const int H = gfx->height();  // 320
 
     // Header: navy background, station name + fetch time
-    gfx->fillRect(0, 0, W, HDR_H, NAVY);
-    gfx->setTextSize(3);
+    screen->fillRect(0, 0, W, HDR_H, NAVY);
+    screen->setTextSize(3);
     int hy = (HDR_H - 24) / 2;
 
-    gfx->setTextColor(YELLOW);
-    gfx->setCursor(X_TIME, hy);
-    gfx->print(station_name);
+    screen->setTextColor(YELLOW);
+    screen->setCursor(X_TIME, hy);
+    screen->print(station_name);
 
     char ts[6];
     struct tm t;
@@ -510,72 +573,72 @@ static void draw_board()
         strlcpy(ts, "--:--", sizeof(ts));
         last_drawn_hhmm = -1;
     }
-    gfx->setTextColor(WHITE);
-    gfx->setCursor(W - 5 * CHAR_W - X_TIME, hy);
-    gfx->print(ts);
+    screen->setTextColor(WHITE);
+    screen->setCursor(W - 5 * CHAR_W - X_TIME, hy);
+    screen->print(ts);
 
     // Yellow separator under header
     int y = HDR_H;
-    gfx->fillRect(0, y, W, 3, YELLOW);
+    screen->fillRect(0, y, W, 3, YELLOW);
     y += 3;
 
     // Column-header row
     uint16_t hdr_bg = gfx->color565(20, 20, 60);
-    gfx->fillRect(0, y, W, ROW_H, hdr_bg);
-    gfx->setTextSize(3);
-    gfx->setTextColor(WHITE);
+    screen->fillRect(0, y, W, ROW_H, hdr_bg);
+    screen->setTextSize(3);
+    screen->setTextColor(WHITE);
     int ty = y + (ROW_H - 24) / 2;
-    gfx->setCursor(X_TIME,                    ty); gfx->print("TIME");
-    gfx->setCursor(X_DEST,                    ty); gfx->print("DESTINATION");
-    gfx->setCursor(R_PLAT   - 4 * CHAR_W,    ty); gfx->print("PLAT");
-    gfx->setCursor(R_STATUS - 6 * CHAR_W,    ty); gfx->print("STATUS");
+    screen->setCursor(X_TIME,                    ty); screen->print("TIME");
+    screen->setCursor(X_DEST,                    ty); screen->print("DESTINATION");
+    screen->setCursor(R_PLAT   - 4 * CHAR_W,    ty); screen->print("PLAT");
+    screen->setCursor(R_STATUS - 6 * CHAR_W,    ty); screen->print("STATUS");
     y += ROW_H;
 
-    gfx->fillRect(0, y, W, 2, YELLOW);
+    screen->fillRect(0, y, W, 2, YELLOW);
     y += 2;
 
     if (N == 0) {
-        gfx->fillRect(0, y, W, H - y, BLACK);
-        gfx->setTextColor(WHITE);
-        gfx->setCursor(X_DEST, y + (ROW_H - 24) / 2);
-        gfx->print("No services");
-        gfx->flush(true);
+        screen->fillRect(0, y, W, H - y, BLACK);
+        screen->setTextColor(WHITE);
+        screen->setCursor(X_DEST, y + (ROW_H - 24) / 2);
+        screen->print("No services");
+        screen_flush();
         return;
     }
 
     // Departure rows
     uint16_t divider = gfx->color565(50, 50, 50);
     for (int i = 0; i < N; i++) {
-        gfx->fillRect(0, y, W, ROW_H, BLACK);
-        gfx->setTextSize(3);
+        screen->fillRect(0, y, W, ROW_H, BLACK);
+        screen->setTextSize(3);
         int ry = y + (ROW_H - 24) / 2;
 
-        gfx->setTextColor(YELLOW);
-        gfx->setCursor(X_TIME, ry);
-        gfx->print(board[i].time);
+        screen->setTextColor(YELLOW);
+        screen->setCursor(X_TIME, ry);
+        screen->print(board[i].time);
 
-        gfx->setCursor(X_DEST, ry);
-        gfx->print(board[i].destination);
+        screen->setCursor(X_DEST, ry);
+        screen->print(board[i].destination);
 
-        gfx->setCursor(R_PLAT - strlen(board[i].platform) * CHAR_W, ry);
-        gfx->print(board[i].platform);
+        screen->setCursor(R_PLAT - strlen(board[i].platform) * CHAR_W, ry);
+        screen->print(board[i].platform);
 
         bool on_time = (strcmp(board[i].status, "On time") == 0);
-        gfx->setTextColor(on_time ? GREEN : RED);
-        gfx->setCursor(R_STATUS - strlen(board[i].status) * CHAR_W, ry);
-        gfx->print(board[i].status);
+        screen->setTextColor(on_time ? GREEN : RED);
+        screen->setCursor(R_STATUS - strlen(board[i].status) * CHAR_W, ry);
+        screen->print(board[i].status);
 
-        gfx->drawFastHLine(0, y + ROW_H - 1, W, divider);
+        screen->drawFastHLine(0, y + ROW_H - 1, W, divider);
         y += ROW_H;
     }
-    if (y < H) gfx->fillRect(0, y, W, H - y, BLACK);
-    gfx->flush(true);
+    if (y < H) screen->fillRect(0, y, W, H - y, BLACK);
+    screen_flush();
 }
 
 static void draw_mandatory_config(const char *reason)
 {
     serial_log("Screen: mandatory config (%s)\n", reason);
-    gfx->fillScreen(BLACK);
+    screen->fillScreen(BLACK);
     slog_y = X_TIME;
     slog("CONFIG REQUIRED!", RED);
     slog(reason);
@@ -586,13 +649,13 @@ static void draw_mandatory_config(const char *reason)
     slog(creds);
     slog("Then open in browser:");
     slog("  http://192.168.4.1");
-    gfx->flush(true);
+    screen_flush();
 }
 
 static void draw_optional_config()
 {
     serial_log("Screen: optional config\n");
-    gfx->fillScreen(BLACK);
+    screen->fillScreen(BLACK);
     slog_y = X_TIME;
     slog("CONFIG MODE", YELLOW);
     slog("Connect to WiFi:");
@@ -603,18 +666,18 @@ static void draw_optional_config()
     slog("  http://192.168.4.1");
     slog("Or shake to exit");
     slog("Auto-exits in 5 min");
-    gfx->flush(true);
+    screen_flush();
 }
 
 static void draw_connecting(int dots)
 {
-    gfx->fillScreen(BLACK);
-    gfx->setTextSize(3);
-    gfx->setTextColor(WHITE);
-    gfx->setCursor(X_TIME, X_TIME);
-    gfx->print("Connecting to WiFi");
-    for (int i = 0; i < dots; i++) gfx->print(".");
-    gfx->flush(true);
+    screen->fillScreen(BLACK);
+    screen->setTextSize(3);
+    screen->setTextColor(WHITE);
+    screen->setCursor(X_TIME, X_TIME);
+    screen->print("Connecting to WiFi");
+    for (int i = 0; i < dots; i++) screen->print(".");
+    screen_flush();
 }
 
 // ── Config portal ─────────────────────────────────────────────────────────────
@@ -730,11 +793,8 @@ static void sync_time()
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
 
-static unsigned long last_fetch        = 0;
-static unsigned long serial_dbg_ms    = 0;
-static int           fetch_retry_idx  = -1;   // -1 = idle; 0..N-1 = retry pending
-static unsigned long fetch_retry_at_ms = 0;
-static char          fetch_err[64]    = "";
+static unsigned long last_fetch     = 0;
+static unsigned long serial_dbg_ms  = 0;
 
 void setup()
 {
@@ -755,6 +815,9 @@ void setup()
 
     load_config();
     imu_init();  // must be before WiFi — Wire.begin() after WiFi+LCD causes a cache panic
+
+    fetch_queue = xQueueCreate(1, sizeof(FetchResult));
+    xTaskCreatePinnedToCore(fetch_task_fn, "fetch", 10240, nullptr, 1, &fetch_task_handle, 0);
 
     // WiFi must come before display — RF calibration briefly disables the flash
     // cache; LCD DMA firing during that window causes a Cache panic.
@@ -790,6 +853,24 @@ void setup()
         while (1) delay(100);
     }
     gfx->fillScreen(BLACK);
+
+    // Allocate the off-screen canvas in PSRAM for double buffering.
+    // Drawing goes to canvas; screen_flush() copies it to gfx atomically.
+    // GFX_SKIP_OUTPUT_BEGIN skips the internal gfx->begin() call so the RGB
+    // panel is not initialised a second time (which would crash the driver).
+    // Physical portrait dimensions (320×820) + rotation=1: canvas internal buffer
+    // layout (stride=320, same mapping as gfx) matches the gfx framebuffer exactly,
+    // so screen_flush() can use memcpy instead of a slow rotated per-pixel blit.
+    canvas = new Arduino_Canvas(320 /* physical w */, 820 /* physical h */, gfx, 0, 0, 1 /* rotation */);
+    if (canvas->begin(GFX_SKIP_OUTPUT_BEGIN)) {
+        screen = canvas;
+        Serial.println("Double buffering: canvas active");
+    } else {
+        Serial.println("Double buffering: canvas alloc failed, direct mode");
+        delete canvas;
+        canvas = nullptr;
+        screen = gfx;
+    }
 
     if (has_ssid) {
         // Animate "Connecting to WiFi..." while polling (18 s left after the 2 s above)
@@ -873,43 +954,28 @@ void loop()
             if (getLocalTime(&_t, 0)) {
                 int cur_hhmm = _t.tm_hour * 60 + _t.tm_min;
                 if (cur_hhmm != last_drawn_hhmm) {
-                    gfx->fillScreen(BLACK);
                     draw_board();
                 }
             }
         }
         unsigned long now = millis();
-        if (fetch_retry_idx < 0 && now - last_fetch >= REFRESH_MS) {
-            last_fetch = now;
-            char err[64] = "";
-            if (fetch_departures(err, sizeof(err))) {
-                gfx->fillScreen(BLACK);
+
+        FetchResult fr;
+        if (xQueueReceive(fetch_queue, &fr, 0) == pdTRUE) {
+            fetch_in_progress = false;
+            if (fr.ok) {
+                memcpy(board, fr.deps, fr.n * sizeof(Departure));
+                N = fr.n;
+                strlcpy(station_name, fr.station, sizeof(station_name));
                 draw_board();
             } else {
-                strlcpy(fetch_err, err, sizeof(fetch_err));
-                fetch_retry_idx   = 0;
-                fetch_retry_at_ms = now + FETCH_RETRY_DELAYS_MS[0];
-                serial_log("Fetch: retry 1 in %lus\n", FETCH_RETRY_DELAYS_MS[0] / 1000);
+                enter_mandatory_config(fr.err);
             }
         }
-        if (fetch_retry_idx >= 0 && now >= fetch_retry_at_ms) {
-            char err[64] = "";
-            if (fetch_departures(err, sizeof(err))) {
-                fetch_retry_idx = -1;
-                gfx->fillScreen(BLACK);
-                draw_board();
-            } else {
-                strlcpy(fetch_err, err, sizeof(fetch_err));
-                int next = fetch_retry_idx + 1;
-                if (next < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0]))) {
-                    serial_log("Fetch: retry %d in %lus\n", next + 1, FETCH_RETRY_DELAYS_MS[next] / 1000);
-                    fetch_retry_idx   = next;
-                    fetch_retry_at_ms = now + FETCH_RETRY_DELAYS_MS[next];
-                } else {
-                    fetch_retry_idx = -1;
-                    enter_mandatory_config(fetch_err);
-                }
-            }
+
+        if (!fetch_in_progress && now - last_fetch >= REFRESH_MS) {
+            last_fetch = now;
+            kick_fetch();
         }
         break;
     }
@@ -925,10 +991,8 @@ void loop()
                     break;
                 }
                 last_fetch = now;
-                fetch_retry_idx = -1;
             }
             state = WORKING;
-            gfx->fillScreen(BLACK);
             draw_board();
         }
         break;
@@ -952,11 +1016,9 @@ void loop()
                 if (fetch_departures(err, sizeof(err))) {
                     imu_ready_at_ms = millis() + 2000;
                     sync_time();
-                    last_fetch      = millis();
-                    fetch_retry_idx = -1;
+                    last_fetch  = millis();
                     portal_stop();
                     state = WORKING;
-                    gfx->fillScreen(BLACK);
                     draw_board();
                 }
             }
