@@ -675,36 +675,19 @@ static void portal_stop()  { portal_active = false; }
 
 // ── State transitions ─────────────────────────────────────────────────────────
 
-// Switches WiFi to pure AP mode, draws the error screen, and starts the portal.
-// Safe to call from any state.
+// Draws the error screen and starts the portal.  AP is always up since setup().
 static void enter_mandatory_config(const char *reason)
 {
-    imu_ready_at_ms = millis() + 2000;  // WiFi mode change may write NVS → suppress Wire reads
     portal_stop();
-    WiFi.mode(WIFI_AP_STA);
-    delay(100);
-    WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
-    // After softAPdisconnect(true) the AP config is cleared; the mode change
-    // restarts the AP interface asynchronously.  Poll until 192.168.4.1 is
-    // assigned (proof the AP is truly up) rather than relying on a fixed delay.
-    {
-        unsigned long t0 = millis();
-        while ((uint32_t)WiFi.softAPIP() == 0 && millis() - t0 < 3000) delay(50);
-        serial_log("AP IP: %s (%lums)\n", WiFi.softAPIP().toString().c_str(), millis() - t0);
-    }
     last_mandatory_retry_ms = millis();
     draw_mandatory_config(reason);
     portal_start();
     state = MANDATORY_CONFIG;
 }
 
-// Adds AP alongside the existing STA connection so home WiFi stays active.
+// Shows config UI and opens the portal.  AP is always up since setup().
 static void enter_optional_config()
 {
-    imu_ready_at_ms = millis() + 2000;  // WiFi mode change may write NVS → suppress Wire reads
-    WiFi.mode(WIFI_AP_STA);
-    delay(100);
-    WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
     draw_optional_config();
     portal_start();
     optional_config_enter_ms = millis();
@@ -778,6 +761,14 @@ void setup()
             wifi_ok = true;
             Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
             sync_time();
+            WiFi.mode(WIFI_AP_STA);
+            delay(100);
+            WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
+            {
+                unsigned long t0 = millis();
+                while ((uint32_t)WiFi.softAPIP() == 0 && millis() - t0 < 3000) delay(50);
+                Serial.printf("AP IP: %s (%lums)\n", WiFi.softAPIP().toString().c_str(), millis() - t0);
+            }
         } else {
             snprintf(reason, sizeof(reason), "No WiFi: %s", cfg_ssid);
             WiFi.mode(WIFI_AP_STA);
@@ -814,10 +805,6 @@ void setup()
         fetch_ok = fetch_departures(err, sizeof(err));
     }
     if (!fetch_ok) {
-        // WiFi connected but fetch failed — switch to AP and show config screen.
-        WiFi.mode(WIFI_AP_STA);
-        delay(100);
-        WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
         draw_mandatory_config(err);
         portal_start();
         state = MANDATORY_CONFIG;
