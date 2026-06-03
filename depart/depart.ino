@@ -418,6 +418,8 @@ static bool fetch_departures(char *err_buf, size_t err_len)
     client.setInsecure();
 
     HTTPClient http;
+    http.setTimeout(2000);
+    http.setConnectTimeout(2000);
     if (!http.begin(client, api_url)) {
         strlcpy(err_buf, "HTTP begin failed", err_len);
         return false;
