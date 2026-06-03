@@ -606,7 +606,16 @@ static void draw_optional_config()
     gfx->flush(true);
 }
 
-
+static void draw_connecting(int dots)
+{
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(3);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(X_TIME, X_TIME);
+    gfx->print("Connecting to WiFi");
+    for (int i = 0; i < dots; i++) gfx->print(".");
+    gfx->flush(true);
+}
 
 // ── Config portal ─────────────────────────────────────────────────────────────
 
@@ -667,7 +676,7 @@ static void portal_server_init()
         restart_at_ms = millis() + 2000;
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "text/html",
-            "<html><body><h1>Saved!</h1><p>Restarting...</p></body></html>");
+            "<html><body><h1>Saved!</h1><p>Restarting...</p><p>You can close the tab!</p></body></html>");
     });
     server.begin();
 }
@@ -742,8 +751,9 @@ void setup()
     imu_ready_at_ms = millis() + 2000;
     bool wifi_ok = false;
     char reason[64] = "";
+    bool has_ssid = (strlen(cfg_ssid) != 0);
 
-    if (strlen(cfg_ssid) == 0) {
+    if (!has_ssid) {
         strlcpy(reason, "No WiFi configured", sizeof(reason));
         WiFi.mode(WIFI_AP_STA);
         delay(100);
@@ -752,12 +762,38 @@ void setup()
         Serial.printf("WiFi: connecting to %s\n", cfg_ssid);
         WiFi.persistent(false);  // don't write credentials to NVS — avoids cache-disable window
         WiFi.begin(cfg_ssid, cfg_pass);
+    }
+
+    // Bind the web server socket here — after WiFi init so the lwIP stack
+    // and its semaphores exist, but before any portal_start() call.
+    portal_server_init();
+
+    // Display init (always after WiFi).  For the STA path, delay 2 s to let RF
+    // calibration complete; the no-SSID path already gets settling time from
+    // softAP() + portal_server_init() above.
+    if (has_ssid) delay(2000);
+    pinMode(GFX_BL, OUTPUT);
+    digitalWrite(GFX_BL, LOW);  // LOW = ON (NPN transistor)
+    if (!gfx->begin()) {
+        Serial.println("ERROR: display init failed");
+        while (1) delay(100);
+    }
+    gfx->fillScreen(BLACK);
+
+    if (has_ssid) {
+        // Animate "Connecting to WiFi..." while polling (18 s left after the 2 s above)
         unsigned long t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-            delay(500);
-            Serial.print(".");
+        int dots = 0;
+        unsigned long last_dot_ms = 0;
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 18000) {
+            unsigned long now = millis();
+            if (now - last_dot_ms >= 1000) {
+                last_dot_ms = now;
+                draw_connecting(dots);
+                dots = (dots + 1) % 4;
+            }
+            delay(100);
         }
-        Serial.println();
         if (WiFi.status() == WL_CONNECTED) {
             wifi_ok = true;
             Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
@@ -777,19 +813,6 @@ void setup()
             WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
         }
     }
-
-    // Bind the web server socket here — after WiFi init so the lwIP stack
-    // and its semaphores exist, but before any portal_start() call.
-    portal_server_init();
-
-    // Display init (always after WiFi)
-    pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, LOW);  // LOW = ON (NPN transistor)
-    if (!gfx->begin()) {
-        Serial.println("ERROR: display init failed");
-        while (1) delay(100);
-    }
-    gfx->fillScreen(BLACK);
 
     if (!wifi_ok) {
         draw_mandatory_config(reason);
