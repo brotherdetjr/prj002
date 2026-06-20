@@ -1,1035 +1,143 @@
-/*
- * Makerfabs ESP32-S3 Parallel TFT 3.16" ST7701S
- * Railway departure board — live via national-rail-api.davwheat.dev
- *
- * Libraries required (Arduino Library Manager):
- *   - Arduino_GFX_Library  (moononournation)
- *   - ArduinoJson          (bblanchon) v7+
- *   - QMI8658              (Makerfabs or compatible)
- */
-
 #include <Arduino_GFX_Library.h>
-#include <Wire.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include <Preferences.h>
-#include <nvs_flash.h>
-#include <WebServer.h>
-#include <time.h>
 #include <sys/time.h>
-#include <esp_sntp.h>
+#include <time.h>
 
-#define BLACK   RGB565_BLACK
-#define WHITE   RGB565_WHITE
-#define YELLOW  RGB565_YELLOW
-#define GREEN   RGB565_GREEN
-#define RED     RGB565_RED
-#define NAVY    RGB565_NAVY
+static void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// ── Display ───────────────────────────────────────────────────────────────────
-
-#define GFX_BL 46
-
-static const uint8_t mf_st7701_init[] = {
-    BEGIN_WRITE,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x13,
-    WRITE_C8_D8, 0xEF, 0x08,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x10,
-    WRITE_C8_D16, 0xC0, 0xE5,0x02,
-    WRITE_C8_D16, 0xC1, 0x15,0x0A,
-    WRITE_C8_D16, 0xC2, 0x07,0x02,
-    WRITE_C8_D8,  0xCC, 0x10,
-    WRITE_COMMAND_8, 0xB0, WRITE_BYTES, 16,
-        0x00,0x08,0x51,0x0D, 0xCE,0x06,0x00,0x08,
-        0x08,0x24,0x05,0xD0, 0x0F,0x6F,0x36,0x1F,
-    WRITE_COMMAND_8, 0xB1, WRITE_BYTES, 16,
-        0x00,0x10,0x4F,0x0C, 0x11,0x05,0x00,0x07,
-        0x07,0x18,0x02,0xD3, 0x11,0x6E,0x34,0x1F,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x11,
-    WRITE_C8_D8,  0xB0, 0x4D,
-    WRITE_C8_D8,  0xB1, 0x37,
-    WRITE_C8_D8,  0xB2, 0x87,
-    WRITE_C8_D8,  0xB3, 0x80,
-    WRITE_C8_D8,  0xB5, 0x4A,
-    WRITE_C8_D8,  0xB7, 0x85,
-    WRITE_C8_D8,  0xB8, 0x21,
-    WRITE_C8_D16, 0xB9, 0x00,0x13,
-    WRITE_C8_D8,  0xC0, 0x09,
-    WRITE_C8_D8,  0xC1, 0x78,
-    WRITE_C8_D8,  0xC2, 0x78,
-    WRITE_C8_D8,  0xD0, 0x88,
-    WRITE_COMMAND_8, 0xE0, WRITE_BYTES, 3, 0x80,0x00,0x02,
-    WRITE_COMMAND_8, 0xE1, WRITE_BYTES, 11,
-        0x0F,0xA0,0x00,0x00, 0x10,0xA0,0x00,0x00, 0x00,0x60,0x60,
-    WRITE_COMMAND_8, 0xE2, WRITE_BYTES, 13,
-        0x30,0x30,0x60,0x60, 0x45,0xA0,0x00,0x00,
-        0x46,0xA0,0x00,0x00, 0x00,
-    WRITE_COMMAND_8, 0xE3, WRITE_BYTES, 4, 0x00,0x00,0x33,0x33,
-    WRITE_C8_D16, 0xE4, 0x44,0x44,
-    WRITE_COMMAND_8, 0xE5, WRITE_BYTES, 16,
-        0x0F,0x4A,0xA0,0xA0, 0x11,0x4A,0xA0,0xA0,
-        0x13,0x4A,0xA0,0xA0, 0x15,0x4A,0xA0,0xA0,
-    WRITE_COMMAND_8, 0xE6, WRITE_BYTES, 4, 0x00,0x00,0x33,0x33,
-    WRITE_C8_D16, 0xE7, 0x44,0x44,
-    WRITE_COMMAND_8, 0xE8, WRITE_BYTES, 16,
-        0x10,0x4A,0xA0,0xA0, 0x12,0x4A,0xA0,0xA0,
-        0x14,0x4A,0xA0,0xA0, 0x16,0x4A,0xA0,0xA0,
-    WRITE_COMMAND_8, 0xEB, WRITE_BYTES, 7, 0x02,0x00,0x4E,0x4E,0xEE,0x44,0x00,
-    WRITE_COMMAND_8, 0xED, WRITE_BYTES, 16,
-        0xFF,0xFF,0x04,0x56, 0x72,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0x27, 0x65,0x40,0xFF,0xFF,
-    WRITE_COMMAND_8, 0xEF, WRITE_BYTES, 6, 0x08,0x08,0x08,0x40,0x3F,0x64,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x13,
-    WRITE_C8_D16, 0xE8, 0x00,0x0E,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x00,
-    WRITE_COMMAND_8, 0x11,
-    END_WRITE,
-    DELAY, 120,
-    BEGIN_WRITE,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x13,
-    WRITE_C8_D16, 0xE8, 0x00,0x0C,
-    END_WRITE,
-    DELAY, 10,
-    BEGIN_WRITE,
-    WRITE_C8_D16, 0xE8, 0x00,0x00,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77,0x01,0x00,0x00,0x00,
-    WRITE_C8_D8,  0x3A, 0x55,
-    WRITE_C8_D8,  0x36, 0x00,
-    WRITE_C8_D8,  0x35, 0x00,
-    WRITE_COMMAND_8, 0x29,
-    END_WRITE,
-    DELAY, 20
-};
-
-Arduino_DataBus *bus = new Arduino_SWSPI(
-    GFX_NOT_DEFINED /* DC */, 45 /* CS */,
-    39 /* SCK */, 40 /* MOSI */, GFX_NOT_DEFINED /* MISO */);
-
-Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
-    7 /* DE */, 4 /* VSYNC */, 5 /* HSYNC */, 6 /* PCLK */,
-    12 /* R0 */, 11 /* R1 */, 8  /* R2 */, 16 /* R3 */, 15 /* R4 */,
-     0 /* G0 */, 14 /* G1 */, 10 /* G2 */,  9 /* G3 */,  3 /* G4 */, 13 /* G5 */,
-    48 /* B0 */, 47 /* B1 */,  1 /* B2 */, 21 /* B3 */, 41 /* B4 */,
-    1 /* hsync_polarity */,
-    10 /* hsync_front_porch */, 8 /* hsync_pulse_width */, 50 /* hsync_back_porch */,
-    1 /* vsync_polarity */,
-    10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 20 /* vsync_back_porch */,
-    0 /* pclk_active_neg */, GFX_NOT_DEFINED /* prefer_speed */,
-    false /* useBigEndian */, 0 /* de_idle_high */, 0 /* pclk_idle_high */,
-    820 * 10 /* bounce_buffer_size_px */);
-
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
-    false /* auto_flush: we call flush(true) manually after each screen update */,
-    bus, GFX_NOT_DEFINED /* RST */,
-    mf_st7701_init, sizeof(mf_st7701_init));
-
-// Double-buffered drawing target: canvas renders off-screen, flush() pushes atomically.
-// Falls back to gfx if PSRAM allocation fails.
-static Arduino_Canvas *canvas = nullptr;
-static Arduino_GFX    *screen = nullptr;
-static void screen_flush() {
-    // Canvas uses physical portrait dimensions with rotation=1, so its buffer
-    // layout matches gfx's framebuffer exactly — a memcpy suffices, no rotation.
-    if (canvas)
-        memcpy(gfx->getFramebuffer(), canvas->getFramebuffer(), 320 * 820 * 2);
-    gfx->flush(true);
-}
-
-// ── Screen log ───────────────────────────────────────────────────────────────
-
-#define X_TIME 10  // left margin (px); shared with departure board layout
-
-static int slog_y = 0;
-
-static void slog(const char *msg, uint16_t color = WHITE)
+static void log(const char *fmt, ...)
 {
-    screen->setTextSize(3);
-    screen->setTextColor(color);
-    screen->setCursor(X_TIME, slog_y);
-    screen->print(msg);
-    slog_y += 25;
-}
-
-static bool serial_dbg_anchored = false;
-static void serial_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-// ── Config (persisted to NVS via Preferences) ────────────────────────────────
-
-#define REFRESH_MS 60000UL
-
-static char cfg_ssid[64]   = "";
-static char cfg_pass[64]   = "";
-static char cfg_station[8] = "MZH";
-static char api_url[72]    = "";
-static unsigned long imu_ready_at_ms = 0;
-
-// RTC_NOINIT_ATTR: startup code never re-initialises this section, so values
-// survive esp_restart() (unlike RTC_DATA_ATTR which is re-copied from flash
-// on every non-deep-sleep boot).  Magic number guards against stale data on
-// a true power-on reset.
-#define RTC_SAVE_MAGIC 0xCAFED00D
-RTC_NOINIT_ATTR static uint32_t rtc_magic;
-RTC_NOINIT_ATTR static char     rtc_ssid[64];
-RTC_NOINIT_ATTR static char     rtc_pass[64];
-RTC_NOINIT_ATTR static char     rtc_station[8];
-
-static void load_config()
-{
-    Preferences prefs;
-    bool ok = prefs.begin("depart", true);
-    Serial.printf("Prefs load: begin=%d\n", ok);
-    if (ok) {
-        prefs.getString("ssid",    cfg_ssid,    sizeof(cfg_ssid));
-        prefs.getString("pass",    cfg_pass,    sizeof(cfg_pass));
-        prefs.getString("station", cfg_station, sizeof(cfg_station));
-        prefs.end();
-    }
-    Serial.printf("Prefs load: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
-    snprintf(api_url, sizeof(api_url),
-        "https://national-rail-api.davwheat.dev/departures/%s", cfg_station);
-}
-
-static bool nvs_open_rw(Preferences &prefs)
-{
-    if (prefs.begin("depart", false)) return true;
-    // NVS is corrupted (likely from a crash-interrupted write).  Erase the
-    // whole partition and reinitialise before retrying.
-    Serial.println("NVS open failed — erasing partition and retrying");
-    nvs_flash_erase();
-    nvs_flash_init();
-    return prefs.begin("depart", false);
-}
-
-static void save_config()
-{
-    Preferences prefs;
-    if (!nvs_open_rw(prefs)) {
-        Serial.println("Prefs save: failed to open namespace");
-        return;
-    }
-    prefs.putString("ssid",    cfg_ssid);
-    prefs.putString("pass",    cfg_pass);
-    prefs.putString("station", cfg_station);
-    prefs.end();
-    Serial.printf("Prefs save: ssid='%s' station='%s'\n", cfg_ssid, cfg_station);
-}
-
-// ── Departure data ────────────────────────────────────────────────────────────
-
-// Landscape: 820 px wide × 320 px tall.
-// textSize(3): 18 px/char wide, 24 px/char tall.
-// TIME and DEST are left-aligned; PLAT and STATUS are right-aligned to R_PLAT / R_STATUS.
-//   TIME    left  x=10   (5 ch × 18 =  90 px)
-//   DEST    left  x=116  (up to ~37 ch before PLAT, truncated in struct)
-//   PLAT    right r=620
-//   STATUS  right r=810  (820 - 10 margin)
-#define X_DEST   116
-#define R_PLAT   620   // right edge of PLAT column
-#define R_STATUS 810   // right edge of STATUS column
-
-#define CHAR_W  18  // textSize(3): 6 px × 3
-
-#define HDR_H  52   // header section height (px)
-#define ROW_H  38   // height of each table row (px)
-
-#define MAX_DEPARTURES 6
-
-struct Departure {
-    char time[6];         // "HH:MM"
-    char destination[28]; // station name, truncated to fit
-    char platform[5];     // "1", "2", "-", "BUS"
-    char status[12];      // "On time", "Delayed", "Cancelled", "Exp HH:MM"
-};
-
-static Departure board[MAX_DEPARTURES];
-static int N = 0;
-static char station_name[32] = "";
-static int  last_drawn_hhmm  = -1;  // hour*60+min at last draw_board(); -1 = never drawn
-
-// ── State machine ─────────────────────────────────────────────────────────────
-
-enum State { MANDATORY_CONFIG, WORKING, OPTIONAL_CONFIG };
-static State state = MANDATORY_CONFIG;
-
-// ── IMU (QMI8658) ─────────────────────────────────────────────────────────────
-
-#define IMU_SDA  17
-#define IMU_SCL  18
-#define IMU_ADDR 0x6B
-
-#define SHAKE_PEAK_THRESH  3.2f   // |dominant axis| required to register a strong peak
-#define SHAKE_ALT_DECAY    0.96f  // per-sample decay factor for alternation counter
-#define SHAKE_ALT_ENTER    2.5f   // alternation count to enter shaking
-#define SHAKE_ALT_EXIT     1.5f   // alternation count to exit shaking
-#define SHAKE_COOLDOWN_MS     3000UL
-#define OPTIONAL_CONFIG_TIMEOUT_MS (5 * 60 * 1000UL)
-#define WIFI_AP_SID "DepartBoard"
-#define WIFI_AP_PASS "t123"
-
-static bool          imu_ok                    = false;
-static bool          imu_gravity_initialized   = false;
-static unsigned long optional_config_enter_ms  = 0;
-static unsigned long last_mandatory_retry_ms   = 0;
-
-static float         gravityX = 0.0f, gravityY = 0.0f, gravityZ = 0.0f;
-static const float   kAlpha   = 0.95f;
-static unsigned long shake_cooldown_ms = 0;
-static float         dbg_energy        = 0.0f;
-static float         dbg_count         = 0.0f;
-static float         dbg_ax = 0, dbg_ay = 0, dbg_az = 0, dbg_dx = 0, dbg_dy = 0, dbg_dz = 0;
-static float         alternations      = 0.0f;
-static int           lastStrongSign    = 0;
-static bool          shaking           = false;
-
-static bool imu_write_reg(uint8_t reg, uint8_t val)
-{
-    Wire.beginTransmission(IMU_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    return Wire.endTransmission() == 0;
-}
-
-// IRAM_ATTR: called from loop() while WiFi may have flash cache disabled
-static bool IRAM_ATTR imu_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
-{
-    Wire.beginTransmission(IMU_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    Wire.requestFrom((uint8_t)IMU_ADDR, len);
-    for (uint8_t i = 0; i < len; i++) {
-        if (!Wire.available()) return false;
-        buf[i] = Wire.read();
-    }
-    return true;
-}
-
-static void imu_init()
-{
-    Wire.begin(IMU_SDA, IMU_SCL);
-    delay(50);  // let IMU power rail stabilise
-    uint8_t who = 0;
-    imu_read_regs(0x00, &who, 1);
-    if (who != 0x05) {
-        Serial.printf("IMU: WHO_AM_I=0x%02X (expected 0x05)\n", who);
-        return;
-    }
-    imu_write_reg(0x03, 0x26);  // CTRL2: ACC ±4 g, 125 Hz (bits[6:4]=001)
-    imu_write_reg(0x08, 0x01);  // CTRL7: ACC enable
-    imu_ok = true;
-    Serial.println("IMU OK");
-}
-
-static bool IRAM_ATTR check_shake()
-{
-    if (!imu_ok) return false;
-    if (millis() < imu_ready_at_ms) return false;
-
-    uint8_t buf[6];
-    if (!imu_read_regs(0x35, buf, 6)) return false;
-
-    int16_t rx = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
-    int16_t ry = (int16_t)((uint16_t)buf[3] << 8 | buf[2]);
-    int16_t rz = (int16_t)((uint16_t)buf[5] << 8 | buf[4]);
-    const float scale = 4.0f / 32768.0f;
-    float ax = rx * scale, ay = ry * scale, az = rz * scale;
-
-    if (!imu_gravity_initialized) {
-        gravityX = ax; gravityY = ay; gravityZ = az;
-        imu_gravity_initialized = true;
-        return false;
-    }
-
-    // Slower LPF keeps shake energy in dx/dy/dz rather than absorbing it into gravity
-    gravityX = kAlpha * gravityX + (1.0f - kAlpha) * ax;
-    gravityY = kAlpha * gravityY + (1.0f - kAlpha) * ay;
-    gravityZ = kAlpha * gravityZ + (1.0f - kAlpha) * az;
-
-    float dx = ax - gravityX;
-    float dy = ay - gravityY;
-    float dz = az - gravityZ;
-    dbg_ax = ax; dbg_ay = ay; dbg_az = az; dbg_dx = dx; dbg_dy = dy; dbg_dz = dz;
-
-    // Dominant axis: whichever of dx/dy/dz has the largest absolute value
-    float axAbs = fabsf(dx), ayAbs = fabsf(dy), azAbs = fabsf(dz);
-    float dominant;
-    if (axAbs > ayAbs && axAbs > azAbs)  dominant = dx;
-    else if (ayAbs > azAbs)              dominant = dy;
-    else                                 dominant = dz;
-
-    // Count sign reversals of the dominant axis above the peak threshold
-    if (fabsf(dominant) > SHAKE_PEAK_THRESH) {
-        int sign = dominant > 0.0f ? 1 : -1;
-        if (sign != lastStrongSign) {
-            alternations += 1.0f;
-            lastStrongSign = sign;
-        }
-    }
-    alternations *= SHAKE_ALT_DECAY;
-
-    dbg_energy = alternations;
-    dbg_count  = (float)lastStrongSign;
-
-    uint32_t now = millis();
-    if (now < shake_cooldown_ms) return false;
-
-    if (!shaking) {
-        if (alternations > SHAKE_ALT_ENTER) {
-            shaking           = true;
-            shake_cooldown_ms = now + SHAKE_COOLDOWN_MS;
-            return true;
-        }
-    } else {
-        if (alternations < SHAKE_ALT_EXIT) {
-            shaking = false;
-        }
-    }
-    return false;
-}
-
-// ── Serial logging ────────────────────────────────────────────────────────────
-
-static void serial_log(const char *fmt, ...)
-{
-    serial_dbg_anchored = false;
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     struct tm t;
     localtime_r(&tv.tv_sec, &t);
-    Serial.printf("%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
-                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                  t.tm_hour, t.tm_min, t.tm_sec, tv.tv_usec / 1000);
-    char buf[128];
+    char msg[256];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    Serial.print(buf);
+    Serial.printf("%04d-%02d-%02d %02d:%02d:%02d.%03ld %s\n", t.tm_year + 1900,
+                  t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+                  tv.tv_usec / 1000, msg);
 }
 
-static void serial_imu_debug()
-{
-    if (serial_dbg_anchored) Serial.print("\033[2A\r");
-    serial_dbg_anchored = true;
-    unsigned long cdwn = (shake_cooldown_ms > millis()) ? (shake_cooldown_ms - millis()) / 1000 : 0;
-    Serial.printf("ax=%6.2f  ay=%6.2f  az=%6.2f  dx=%6.2f  dy=%6.2f  dz=%6.2f\n",
-                  dbg_ax, dbg_ay, dbg_az, dbg_dx, dbg_dy, dbg_dz);
-    Serial.printf("alts=%5.2f  sign=%+2d     cd=%lus%s\n",
-                  dbg_energy, (int)dbg_count, cdwn, shaking ? " [SHAKING]" : "          ");
-}
+#define GFX_BL 46
 
-// ── Fetch ─────────────────────────────────────────────────────────────────────
+// Display Pin config: Makerfabs/ESP32-S3_Parallel_TFT_3.16_ST7701S repo,
+// PDQgraphicstest/Arduino_GFX_dev_device.h, #define ESP32_S3_RGB section.
+// Init sequence: tl032fwv01_init_operations from Arduino_RGB_Display.h
+// (library built-in for the 320x820 bar display), verbatim except
+// register 0x3A changed 0x66→0x55: our parallel interface is wired
+// 5+6+5 pins (RGB565, 16-bit); 0x66 would set 18-bit mode and drop
+// the blue channel, making white appear yellow.
+// clang-format off
+static const uint8_t init_ops[] = {
+    BEGIN_WRITE, WRITE_COMMAND_8, 0x11, END_WRITE, DELAY, 100,
 
-struct FetchResult {
-    bool     ok;
-    char     err[64];
-    Departure deps[MAX_DEPARTURES];
-    int      n;
-    char     station[32];
-};
+    BEGIN_WRITE,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x13,
+    WRITE_C8_D8, 0xEF, 0x08,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x10,
+    WRITE_C8_D16, 0xC0, 0xE5, 0x02,
+    WRITE_C8_D16, 0xC1, 0x0C, 0x0A,
+    WRITE_C8_D16, 0xC2, 0x07, 0x0F,
+    WRITE_C8_D8, 0xC2, 0x02,
+    WRITE_C8_D8, 0xCC, 0x10,
+    WRITE_C8_D8, 0xCD, 0x08,
+    WRITE_COMMAND_8, 0xB0, WRITE_BYTES, 16,
+        0x00, 0x08, 0x51, 0x0D, 0xCE, 0x06, 0x00, 0x08, 0x08, 0x1D, 0x02, 0xD0, 0x0F, 0x6F, 0x36, 0x3F,
+    WRITE_COMMAND_8, 0xB1, WRITE_BYTES, 16,
+        0x00, 0x10, 0x4F, 0x0C, 0x11, 0x05, 0x00, 0x07, 0x07, 0x1F, 0x05, 0xD3, 0x11, 0x6E, 0x34, 0x3F,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x11,
+    WRITE_C8_D8, 0xB0, 0x4D,
+    WRITE_C8_D8, 0xB1, 0x1C,
+    WRITE_C8_D8, 0xB2, 0x87,
+    WRITE_C8_D8, 0xB3, 0x80,
+    WRITE_C8_D8, 0xB5, 0x47,
+    WRITE_C8_D8, 0xB7, 0x85,
+    WRITE_C8_D8, 0xB8, 0x21,
+    WRITE_C8_D8, 0xB9, 0x10,
+    WRITE_C8_D8, 0xC1, 0x78,
+    WRITE_C8_D8, 0xC2, 0x78,
+    WRITE_C8_D8, 0xD0, 0x88,
+    END_WRITE, DELAY, 100,
 
-static QueueHandle_t fetch_queue        = nullptr;
-static TaskHandle_t  fetch_task_handle  = nullptr;
-static volatile bool fetch_in_progress  = false;
-static FetchResult   fetch_staging;
+    BEGIN_WRITE,
+    WRITE_COMMAND_8, 0xE0, WRITE_BYTES, 3, 0x80, 0x00, 0x02,
+    WRITE_COMMAND_8, 0xE1, WRITE_BYTES, 11, 0x04, 0xA0, 0x00, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x00, 0x60, 0x60,
+    WRITE_COMMAND_8, 0xE2, WRITE_BYTES, 13, 0x30, 0x30, 0x60, 0x60, 0x3C, 0xA0, 0x00, 0x00, 0x3D, 0xA0, 0x00, 0x00, 0x00,
+    WRITE_COMMAND_8, 0xE3, WRITE_BYTES, 4, 0x00, 0x00, 0x33, 0x33,
+    WRITE_C8_D16, 0xE4, 0x44, 0x44,
+    WRITE_COMMAND_8, 0xE5, WRITE_BYTES, 16, 0x06, 0x3E, 0xA0, 0xA0, 0x08, 0x40, 0xA0, 0xA0, 0x0A, 0x42, 0xA0, 0xA0, 0x0C, 0x44, 0xA0, 0xA0,
+    WRITE_COMMAND_8, 0xE6, WRITE_BYTES, 4, 0x00, 0x00, 0x33, 0x33,
+    WRITE_C8_D16, 0xE7, 0x44, 0x44,
+    WRITE_COMMAND_8, 0xE8, WRITE_BYTES, 16, 0x07, 0x3F, 0xA0, 0xA0, 0x09, 0x41, 0xA0, 0xA0, 0x0B, 0x43, 0xA0, 0xA0, 0x0D, 0x45, 0xA0, 0xA0,
+    WRITE_COMMAND_8, 0xEB, WRITE_BYTES, 7, 0x00, 0x01, 0x4E, 0x4E, 0xEE, 0x44, 0x00,
+    WRITE_COMMAND_8, 0xED, WRITE_BYTES, 16, 0xFF, 0xFF, 0x04, 0x56, 0x72, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x27, 0x65, 0x40, 0xFF, 0xFF,
+    WRITE_COMMAND_8, 0xEF, WRITE_BYTES, 6, 0x10, 0x0D, 0x04, 0x08, 0x3F, 0x1F,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x13,
+    WRITE_C8_D16, 0xE8, 0x00, 0x0E,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x00,
+    WRITE_COMMAND_8, 0x11,
+    END_WRITE, DELAY, 120,
 
-static const unsigned long FETCH_RETRY_DELAYS_MS[] = { 1000, 5000, 10000 };
+    BEGIN_WRITE,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x13,
+    WRITE_C8_D16, 0xE8, 0x00, 0x0C,
+    END_WRITE, DELAY, 10,
 
-static void do_fetch()
-{
-    FetchResult &out = fetch_staging;
-    serial_log("Fetch: %s\n", api_url);
-    out.ok        = false;
-    out.n         = 0;
-    out.station[0] = '\0';
-    out.err[0]    = '\0';
+    BEGIN_WRITE,
+    WRITE_C8_D16, 0xE8, 0x00, 0x00,
+    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x00,
+    WRITE_C8_D8, 0x36, 0x00,
+    WRITE_C8_D8, 0x3A, 0x55, /* 0x66 in library = 18-bit; 0x55 = 16-bit RGB565 */
+    WRITE_COMMAND_8, 0x11,
+    END_WRITE, DELAY, 120,
 
-    WiFiClientSecure client;
-    // Skips certificate verification — fine for a local hobby device.
-    client.setInsecure();
+    BEGIN_WRITE, WRITE_COMMAND_8, 0x29, END_WRITE, DELAY, 120};
+// clang-format on
 
-    HTTPClient http;
-    if (!http.begin(client, api_url)) {
-        strlcpy(out.err, "HTTP begin failed", sizeof(out.err));
-        return;
-    }
+Arduino_DataBus *bus =
+    new Arduino_SWSPI(GFX_NOT_DEFINED /* DC */, 45 /* CS */, 39 /* SCK */,
+                      40 /* MOSI */, GFX_NOT_DEFINED /* MISO */);
 
-    int code = http.GET();
-    serial_log("Fetch: HTTP %d\n", code);
-    if (code != HTTP_CODE_OK) {
-        snprintf(out.err, sizeof(out.err), "Cannot fetch data for %s", cfg_station);
-        http.end();
-        return;
-    }
+Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
+    7 /* DE */, 4 /* VSYNC */, 5 /* HSYNC */, 6 /* PCLK */, 12 /* R0 */,
+    11 /* R1 */, 8 /* R2 */, 16 /* R3 */, 15 /* R4 */, 0 /* G0 */, 14 /* G1 */,
+    10 /* G2 */, 9 /* G3 */, 3 /* G4 */, 13 /* G5 */, 48 /* B0 */, 47 /* B1 */,
+    1 /* B2 */, 21 /* B3 */, 41 /* B4 */, 1 /* hsync_polarity */,
+    10 /* hsync_front_porch */, 8 /* hsync_pulse_width */,
+    50 /* hsync_back_porch */, 1 /* vsync_polarity */,
+    10 /* vsync_front_porch */, 8 /* vsync_pulse_width */,
+    20 /* vsync_back_porch */);
 
-    String body = http.getString();
-    http.end();
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
+    320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
+    true /* auto_flush */, bus, GFX_NOT_DEFINED /* RST */, init_ops,
+    sizeof(init_ops));
 
-    JsonDocument doc;
-    DeserializationError jerr = deserializeJson(doc, body);
-    if (jerr) {
-        snprintf(out.err, sizeof(out.err), "JSON err: %s", jerr.c_str());
-        return;
-    }
-
-    strlcpy(out.station, doc["locationName"] | cfg_station, sizeof(out.station));
-
-    // Prefer train services; fall back to bus replacements when trains are absent.
-    JsonArray services = doc["trainServices"];
-    if (services.isNull()) services = doc["busServices"];
-
-    out.n = 0;
-    if (!services.isNull()) {
-        for (JsonObject svc : services) {
-            if (out.n >= MAX_DEPARTURES) break;
-            Departure &d = out.deps[out.n];
-
-            strlcpy(d.time, svc["std"] | "--:--", sizeof(d.time));
-
-            const char *loc = svc["destination"][0]["locationName"] | "Unknown";
-            strlcpy(d.destination, loc, sizeof(d.destination));
-
-            // Buses often have null platform; show "BUS" as a fallback.
-            const char *plat = svc["platform"] | "BUS";
-            strlcpy(d.platform, plat, sizeof(d.platform));
-
-            bool cancelled = svc["isCancelled"] | false;
-            const char *etd = svc["etd"] | "";
-            if (cancelled || strcasecmp(etd, "cancelled") == 0) {
-                strlcpy(d.status, "Cancelled", sizeof(d.status));
-            } else if (strcasecmp(etd, "on time") == 0 || *etd == '\0') {
-                strlcpy(d.status, "On time", sizeof(d.status));
-            } else if (strcasecmp(etd, "delayed") == 0 || strcasecmp(etd, "no report") == 0) {
-                strlcpy(d.status, "Delayed", sizeof(d.status));
-            } else {
-                snprintf(d.status, sizeof(d.status), "Exp %s", etd);
-            }
-
-            out.n++;
-        }
-    }
-    out.ok = true;
-}
-
-// Synchronous wrapper used in setup() and config-transition paths.
-static bool fetch_departures(char *err_buf, size_t err_len)
-{
-    do_fetch();
-    if (fetch_staging.ok) {
-        memcpy(board, fetch_staging.deps, fetch_staging.n * sizeof(Departure));
-        N = fetch_staging.n;
-        strlcpy(station_name, fetch_staging.station, sizeof(station_name));
-    } else if (err_buf) {
-        strlcpy(err_buf, fetch_staging.err, err_len);
-    }
-    return fetch_staging.ok;
-}
-
-static void fetch_task_fn(void *)
-{
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        do_fetch();
-        for (int i = 0; !fetch_staging.ok && i < (int)(sizeof(FETCH_RETRY_DELAYS_MS) / sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
-            serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
-            vTaskDelay(pdMS_TO_TICKS(FETCH_RETRY_DELAYS_MS[i]));
-            do_fetch();
-        }
-        xQueueOverwrite(fetch_queue, &fetch_staging);
-    }
-}
-
-static void kick_fetch()
-{
-    fetch_in_progress = true;
-    xTaskNotifyGive(fetch_task_handle);
-}
-
-// ── Drawing ───────────────────────────────────────────────────────────────────
-
-static void draw_board()
-{
-    serial_log("Screen: departure board\n");
-    const int W = gfx->width();   // 820
-    const int H = gfx->height();  // 320
-
-    // Header: navy background, station name + fetch time
-    screen->fillRect(0, 0, W, HDR_H, NAVY);
-    screen->setTextSize(3);
-    int hy = (HDR_H - 24) / 2;
-
-    screen->setTextColor(YELLOW);
-    screen->setCursor(X_TIME, hy);
-    screen->print(station_name);
-
-    char ts[6];
-    struct tm t;
-    if (getLocalTime(&t, 2000)) {
-        snprintf(ts, sizeof(ts), "%02d:%02d", t.tm_hour, t.tm_min);
-        last_drawn_hhmm = t.tm_hour * 60 + t.tm_min;
-    } else {
-        strlcpy(ts, "--:--", sizeof(ts));
-        last_drawn_hhmm = -1;
-    }
-    screen->setTextColor(WHITE);
-    screen->setCursor(W - 5 * CHAR_W - X_TIME, hy);
-    screen->print(ts);
-
-    // Yellow separator under header
-    int y = HDR_H;
-    screen->fillRect(0, y, W, 3, YELLOW);
-    y += 3;
-
-    // Column-header row
-    uint16_t hdr_bg = gfx->color565(20, 20, 60);
-    screen->fillRect(0, y, W, ROW_H, hdr_bg);
-    screen->setTextSize(3);
-    screen->setTextColor(WHITE);
-    int ty = y + (ROW_H - 24) / 2;
-    screen->setCursor(X_TIME,                    ty); screen->print("TIME");
-    screen->setCursor(X_DEST,                    ty); screen->print("DESTINATION");
-    screen->setCursor(R_PLAT   - 4 * CHAR_W,    ty); screen->print("PLAT");
-    screen->setCursor(R_STATUS - 6 * CHAR_W,    ty); screen->print("STATUS");
-    y += ROW_H;
-
-    screen->fillRect(0, y, W, 2, YELLOW);
-    y += 2;
-
-    if (N == 0) {
-        screen->fillRect(0, y, W, H - y, BLACK);
-        screen->setTextColor(WHITE);
-        screen->setCursor(X_DEST, y + (ROW_H - 24) / 2);
-        screen->print("No services");
-        screen_flush();
-        return;
-    }
-
-    // Departure rows
-    uint16_t divider = gfx->color565(50, 50, 50);
-    for (int i = 0; i < N; i++) {
-        screen->fillRect(0, y, W, ROW_H, BLACK);
-        screen->setTextSize(3);
-        int ry = y + (ROW_H - 24) / 2;
-
-        screen->setTextColor(YELLOW);
-        screen->setCursor(X_TIME, ry);
-        screen->print(board[i].time);
-
-        screen->setCursor(X_DEST, ry);
-        screen->print(board[i].destination);
-
-        screen->setCursor(R_PLAT - strlen(board[i].platform) * CHAR_W, ry);
-        screen->print(board[i].platform);
-
-        bool on_time = (strcmp(board[i].status, "On time") == 0);
-        screen->setTextColor(on_time ? GREEN : RED);
-        screen->setCursor(R_STATUS - strlen(board[i].status) * CHAR_W, ry);
-        screen->print(board[i].status);
-
-        screen->drawFastHLine(0, y + ROW_H - 1, W, divider);
-        y += ROW_H;
-    }
-    if (y < H) screen->fillRect(0, y, W, H - y, BLACK);
-    screen_flush();
-}
-
-static void draw_mandatory_config(const char *reason)
-{
-    serial_log("Screen: mandatory config (%s)\n", reason);
-    screen->fillScreen(BLACK);
-    slog_y = X_TIME;
-    slog("CONFIG REQUIRED!", RED);
-    slog(reason);
-    slog("");
-    slog("Connect to WiFi:");
-    char creds[32] = "";
-    snprintf(creds, sizeof(creds), "  %s / %s", WIFI_AP_SID, WIFI_AP_PASS);
-    slog(creds);
-    slog("Then open in browser:");
-    slog("  http://192.168.4.1");
-    screen_flush();
-}
-
-static void draw_optional_config()
-{
-    serial_log("Screen: optional config\n");
-    screen->fillScreen(BLACK);
-    slog_y = X_TIME;
-    slog("CONFIG MODE", YELLOW);
-    slog("Connect to WiFi:");
-    char creds[32] = "";
-    snprintf(creds, sizeof(creds), "  %s / %s", WIFI_AP_SID, WIFI_AP_PASS);
-    slog(creds);
-    slog("Then open in browser:");
-    slog("  http://192.168.4.1");
-    slog("Or shake to exit");
-    slog("Auto-exits in 5 min");
-    screen_flush();
-}
-
-static void draw_connecting(int dots)
-{
-    screen->fillScreen(BLACK);
-    screen->setTextSize(3);
-    screen->setTextColor(WHITE);
-    screen->setCursor(X_TIME, X_TIME);
-    screen->print("Connecting to WiFi");
-    for (int i = 0; i < dots; i++) screen->print(".");
-    screen_flush();
-}
-
-// ── Config portal ─────────────────────────────────────────────────────────────
-
-static const char CONFIG_HTML[] =
-    "<!DOCTYPE html><html><head>"
-    "<meta charset=utf-8>"
-    "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Departure Board</title>"
-    "<style>"
-    "body{font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em}"
-    "h1{font-size:1.4em}"
-    "label{display:block;margin-top:1em;font-weight:bold}"
-    "input{width:100%;padding:.5em;font-size:1em;box-sizing:border-box}"
-    "small{color:#666}"
-    "button{margin-top:1.5em;width:100%;padding:.75em;font-size:1em;"
-    "background:#00408a;color:#fff;border:none;border-radius:4px;cursor:pointer}"
-    ".pw-wrap{position:relative}"
-    ".pw-wrap input{padding-right:3.5em;-webkit-text-security:disc}"
-    ".pw-wrap input.show{-webkit-text-security:none}"
-    ".pw-toggle{position:absolute;right:.4em;top:50%;transform:translateY(-50%);"
-    "background:none;border:1px solid #aaa;border-radius:3px;padding:.1em .4em;"
-    "font-size:.85em;color:#444;cursor:pointer;margin:0;width:auto}"
-    "</style></head><body>"
-    "<h1>Departure Board</h1>"
-    "<form method=POST action=/save>"
-    "<label>WiFi network</label>"
-    "<input name=ssid value='%SSID%'>"
-    "<label>WiFi password</label>"
-    "<div class=pw-wrap>"
-    "<input id=pass name=pass value='%PASS%'>"
-    "<button type=button class=pw-toggle onclick=\"var i=document.getElementById('pass');"
-    "i.classList.toggle('show');this.textContent=i.classList.contains('show')?'Hide':'Show'\">"
-    "Show</button>"
-    "</div>"
-    "<label>Station code</label>"
-    "<input name=station value='%CODE%' maxlength=4 placeholder='e.g. MZH'>"
-    "<small>3-letter CRS code &mdash; "
-    "<a href=https://www.nationalrail.co.uk/stations_destinations/48541.aspx target=_blank>"
-    "find yours here</a></small>"
-    "<br><button>Save &amp; Reboot</button>"
-    "</form></body></html>";
-
-static WebServer     server(80);
-static bool          portal_active = false;
-static unsigned long restart_at_ms = 0;
-
-// Called once from setup() before WiFi init so the socket is bound to
-// 0.0.0.0:80 while the lwIP stack is in its default clean state.  Once
-// bound, the server accepts connections from any interface (STA or AP)
-// that lwIP adds later.
-static void portal_server_init()
-{
-    server.on("/", HTTP_GET, []() {
-        String html = CONFIG_HTML;
-        html.replace("%SSID%", cfg_ssid);
-        html.replace("%PASS%", cfg_pass);
-        html.replace("%CODE%", cfg_station);
-        server.send(200, "text/html; charset=utf-8", html);
-    });
-    server.on("/save", HTTP_POST, []() {
-        if (server.hasArg("ssid"))    server.arg("ssid").toCharArray(rtc_ssid, sizeof(rtc_ssid));
-        if (server.hasArg("pass"))    server.arg("pass").toCharArray(rtc_pass, sizeof(rtc_pass));
-        if (server.hasArg("station")) {
-            String s = server.arg("station");
-            s.toUpperCase();
-            s.toCharArray(rtc_station, sizeof(rtc_station));
-        }
-        rtc_magic     = RTC_SAVE_MAGIC;
-        restart_at_ms = millis() + 2000;
-        server.sendHeader("Cache-Control", "no-store");
-        server.send(200, "text/html",
-            "<html><body><h1>Saved!</h1><p>Restarting...</p><p>You can close the tab!</p></body></html>");
-    });
-    server.begin();
-}
-
-static void portal_start() { portal_active = true; }
-static void portal_stop()  { portal_active = false; }
-
-// ── State transitions ─────────────────────────────────────────────────────────
-
-// Draws the error screen and starts the portal.  AP is always up since setup().
-static void enter_mandatory_config(const char *reason)
-{
-    last_mandatory_retry_ms = millis();
-    draw_mandatory_config(reason);
-    portal_start();
-    state = MANDATORY_CONFIG;
-}
-
-// Shows config UI and opens the portal.  AP is always up since setup().
-static void enter_optional_config()
-{
-    draw_optional_config();
-    portal_start();
-    optional_config_enter_ms = millis();
-    state = OPTIONAL_CONFIG;
-}
-
-static volatile bool ntp_synced = false;
-
-static void on_ntp_sync(struct timeval *) { ntp_synced = true; }
-
-static void sync_time()
-{
-    configTime(0, 0, "pool.ntp.org");
-    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
-    tzset();
-    esp_sntp_set_time_sync_notification_cb(on_ntp_sync);
-    esp_sntp_set_sync_interval(10000);
-}
-
-// ── Arduino entry points ──────────────────────────────────────────────────────
-
-static unsigned long last_fetch     = 0;
-static unsigned long serial_dbg_ms  = 0;
+// Entry points
 
 void setup()
 {
+    log("Starting application...");
     Serial.begin(115200);
 
-    // Deferred NVS write from the previous boot's config save.
-    // Done here, before any peripheral is initialised, so no ISR can access
-    // cached memory (PSRAM/DROM) while the flash cache is briefly disabled.
-    bool save_pending = (rtc_magic == RTC_SAVE_MAGIC);
-    Serial.printf("RTC save pending=%d station='%s'\n", save_pending, save_pending ? rtc_station : "");
-    if (save_pending) {
-        rtc_magic = 0;
-        strlcpy(cfg_ssid,    rtc_ssid,    sizeof(cfg_ssid));
-        strlcpy(cfg_pass,    rtc_pass,    sizeof(cfg_pass));
-        strlcpy(cfg_station, rtc_station, sizeof(cfg_station));
-        save_config();
-    }
-
-    load_config();
-    imu_init();  // must be before WiFi — Wire.begin() after WiFi+LCD causes a cache panic
-
-    fetch_queue = xQueueCreate(1, sizeof(FetchResult));
-    xTaskCreatePinnedToCore(fetch_task_fn, "fetch", 10240, nullptr, 1, &fetch_task_handle, 0);
-
-    // WiFi must come before display — RF calibration briefly disables the flash
-    // cache; LCD DMA firing during that window causes a Cache panic.
-    // Block IMU polling until RF calibration is well clear.
-    imu_ready_at_ms = millis() + 2000;
-    bool wifi_ok = false;
-    char reason[64] = "";
-    bool has_ssid = (strlen(cfg_ssid) != 0);
-
-    if (!has_ssid) {
-        strlcpy(reason, "No WiFi configured", sizeof(reason));
-        WiFi.mode(WIFI_AP_STA);
-        delay(100);
-        WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
-    } else {
-        Serial.printf("WiFi: connecting to %s\n", cfg_ssid);
-        WiFi.persistent(false);  // don't write credentials to NVS — avoids cache-disable window
-        WiFi.begin(cfg_ssid, cfg_pass);
-    }
-
-    // Bind the web server socket here — after WiFi init so the lwIP stack
-    // and its semaphores exist, but before any portal_start() call.
-    portal_server_init();
-
-    // Display init (always after WiFi).  For the STA path, delay 2 s to let RF
-    // calibration complete; the no-SSID path already gets settling time from
-    // softAP() + portal_server_init() above.
-    if (has_ssid) delay(2000);
     pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, LOW);  // LOW = ON (NPN transistor)
-    if (!gfx->begin()) {
-        Serial.println("ERROR: display init failed");
-        while (1) delay(100);
-    }
-    gfx->fillScreen(BLACK);
-
-    // Allocate the off-screen canvas in PSRAM for double buffering.
-    // Drawing goes to canvas; screen_flush() copies it to gfx atomically.
-    // GFX_SKIP_OUTPUT_BEGIN skips the internal gfx->begin() call so the RGB
-    // panel is not initialised a second time (which would crash the driver).
-    // Physical portrait dimensions (320×820) + rotation=1: canvas internal buffer
-    // layout (stride=320, same mapping as gfx) matches the gfx framebuffer exactly,
-    // so screen_flush() can use memcpy instead of a slow rotated per-pixel blit.
-    canvas = new Arduino_Canvas(320 /* physical w */, 820 /* physical h */, gfx, 0, 0, 1 /* rotation */);
-    if (canvas->begin(GFX_SKIP_OUTPUT_BEGIN)) {
-        screen = canvas;
-        Serial.println("Double buffering: canvas active");
-    } else {
-        Serial.println("Double buffering: canvas alloc failed, direct mode");
-        delete canvas;
-        canvas = nullptr;
-        screen = gfx;
-    }
-
-    if (has_ssid) {
-        // Animate "Connecting to WiFi..." while polling (18 s left after the 2 s above)
-        unsigned long t0 = millis();
-        int dots = 0;
-        unsigned long last_dot_ms = 0;
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 18000) {
-            unsigned long now = millis();
-            if (now - last_dot_ms >= 1000) {
-                last_dot_ms = now;
-                draw_connecting(dots);
-                dots = (dots + 1) % 4;
-            }
-            delay(100);
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            wifi_ok = true;
-            Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
-            sync_time();
-            WiFi.mode(WIFI_AP_STA);
-            delay(100);
-            WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
-            {
-                unsigned long t0 = millis();
-                while ((uint32_t)WiFi.softAPIP() == 0 && millis() - t0 < 3000) delay(50);
-                Serial.printf("AP IP: %s (%lums)\n", WiFi.softAPIP().toString().c_str(), millis() - t0);
-            }
-        } else {
-            snprintf(reason, sizeof(reason), "No WiFi: %s", cfg_ssid);
-            WiFi.mode(WIFI_AP_STA);
-            delay(100);
-            WiFi.softAP(WIFI_AP_SID, WIFI_AP_PASS);
-        }
-    }
-
-    if (!wifi_ok) {
-        draw_mandatory_config(reason);
-        portal_start();
-        state = MANDATORY_CONFIG;
-        return;
-    }
-
-    char err[64] = "";
-    bool fetch_ok = fetch_departures(err, sizeof(err));
-    for (int i = 0; !fetch_ok && i < (int)(sizeof(FETCH_RETRY_DELAYS_MS)/sizeof(FETCH_RETRY_DELAYS_MS[0])); i++) {
-        serial_log("Fetch: retry %d in %lus\n", i + 1, FETCH_RETRY_DELAYS_MS[i] / 1000);
-        delay(FETCH_RETRY_DELAYS_MS[i]);
-        fetch_ok = fetch_departures(err, sizeof(err));
-    }
-    if (!fetch_ok) {
-        draw_mandatory_config(err);
-        portal_start();
-        state = MANDATORY_CONFIG;
-        return;
-    }
-
-    last_fetch = millis();
-    draw_board();
-    state = WORKING;
+    digitalWrite(GFX_BL, LOW); // NPN transistor: LOW = backlight on
+    gfx->begin();
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setTextSize(3);
+    gfx->setCursor(10, 10);
+    gfx->print("white");
+    gfx->setTextColor(RGB565_YELLOW);
+    gfx->setTextSize(3);
+    gfx->setCursor(10, 30);
+    gfx->print("yellow");
 }
 
 void loop()
 {
-    if (portal_active) server.handleClient();
-
-    if (restart_at_ms && millis() >= restart_at_ms) {
-        ESP.restart();  // no portal_stop() — don't close the socket before restart
-    }
-
-    bool shook = check_shake();
-
-    switch (state) {
-    case WORKING: {
-        if (shook) {
-            enter_optional_config();
-            break;
-        }
-        if (ntp_synced) {
-            ntp_synced = false;
-            struct tm _t;
-            if (getLocalTime(&_t, 0)) {
-                int cur_hhmm = _t.tm_hour * 60 + _t.tm_min;
-                if (cur_hhmm != last_drawn_hhmm) {
-                    draw_board();
-                }
-            }
-        }
-        unsigned long now = millis();
-
-        FetchResult fr;
-        if (xQueueReceive(fetch_queue, &fr, 0) == pdTRUE) {
-            fetch_in_progress = false;
-            if (fr.ok) {
-                memcpy(board, fr.deps, fr.n * sizeof(Departure));
-                N = fr.n;
-                strlcpy(station_name, fr.station, sizeof(station_name));
-                draw_board();
-            } else {
-                enter_mandatory_config(fr.err);
-            }
-        }
-
-        if (!fetch_in_progress && now - last_fetch >= REFRESH_MS) {
-            last_fetch = now;
-            kick_fetch();
-        }
-        break;
-    }
-    case OPTIONAL_CONFIG: {
-        bool timed_out = (millis() - optional_config_enter_ms >= OPTIONAL_CONFIG_TIMEOUT_MS);
-        if (shook || timed_out) {
-            portal_stop();
-            unsigned long now = millis();
-            if (now - last_fetch >= REFRESH_MS) {
-                char err[64] = "";
-                if (!fetch_departures(err, sizeof(err))) {
-                    enter_mandatory_config(err);
-                    break;
-                }
-                last_fetch = now;
-            }
-            state = WORKING;
-            draw_board();
-        }
-        break;
-    }
-    case MANDATORY_CONFIG:
-        if (cfg_ssid[0] != '\0' && millis() - last_mandatory_retry_ms >= 10000) {
-            last_mandatory_retry_ms = millis();
-            if (WiFi.status() != WL_CONNECTED) {
-                serial_log("MANDATORY_CONFIG: reconnecting to %s\n", cfg_ssid);
-                // reconnect() reuses STA credentials from the driver; they survive
-                // the disconnect(false)+mode-change in enter_mandatory_config.
-                WiFi.reconnect();
-                unsigned long t0 = millis();
-                while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
-                    if (portal_active) server.handleClient();
-                    delay(200);
-                }
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-                char err[64] = "";
-                if (fetch_departures(err, sizeof(err))) {
-                    imu_ready_at_ms = millis() + 2000;
-                    sync_time();
-                    last_fetch  = millis();
-                    portal_stop();
-                    state = WORKING;
-                    draw_board();
-                }
-            }
-        }
-        break;
-    }
-
-    if (millis() >= serial_dbg_ms) {
-        serial_dbg_ms = millis() + 200;
-        serial_imu_debug();
-    }
-
-    delay(10);  // ~100 Hz — matches QMI8658 shake detection polling rate
+    delay(1000);
+    log("heartbeat");
 }

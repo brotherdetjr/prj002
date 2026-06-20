@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upload depart.ino to ESP32-S3.
+# Upload src/depart.ino to ESP32-S3.
 # Before flashing, reads current firmware from device and saves it with the
 # sketch source to backups/YYYYDDMMHHmmSS.bak/
 # Use --no-backup to skip the backup step.
@@ -50,13 +50,18 @@ else
     echo "Backup : skipped (--no-backup)"
 fi
 
+# ── Lint ──────────────────────────────────────────────────────────────────────
+LINT_STEP=$( $BACKUP && echo "[3/5]" || echo "[1/3]" )
+echo "$LINT_STEP Checking formatting..."
+clang-format --dry-run --Werror "$SKETCH_DIR"/*.ino
+
 # ── Compile ───────────────────────────────────────────────────────────────────
-COMPILE_STEP=$( $BACKUP && echo "[3/4]" || echo "[1/2]" )
+COMPILE_STEP=$( $BACKUP && echo "[4/5]" || echo "[2/3]" )
 echo "$COMPILE_STEP Compiling..."
 arduino-cli compile --fqbn "$FQBN" "$SKETCH_DIR"
 
 # ── Upload ────────────────────────────────────────────────────────────────────
-UPLOAD_STEP=$( $BACKUP && echo "[4/4]" || echo "[2/2]" )
+UPLOAD_STEP=$( $BACKUP && echo "[5/5]" || echo "[3/3]" )
 echo "$UPLOAD_STEP Uploading..."
 arduino-cli upload --fqbn "$FQBN" -p "$PORT" "$SKETCH_DIR"
 
