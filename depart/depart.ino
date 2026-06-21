@@ -2,6 +2,10 @@
 #include <sys/time.h>
 #include <time.h>
 
+// All available GFX fonts (copied from Arduino_GFX HelloWorldGfxfont example;
+// more at https://github.com/moononournation/ArduinoFreeFontFile)
+#include "font1.h"
+
 static void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void log(const char *fmt, ...)
@@ -126,14 +130,37 @@ void setup()
     digitalWrite(GFX_BL, LOW); // NPN transistor: LOW = backlight on
     gfx->begin();
     gfx->fillScreen(RGB565_BLACK);
-    gfx->setTextColor(RGB565_WHITE);
-    gfx->setTextSize(3);
-    gfx->setCursor(10, 10);
-    gfx->print("white");
-    gfx->setTextColor(RGB565_YELLOW);
-    gfx->setTextSize(3);
-    gfx->setCursor(10, 30);
-    gfx->print("yellow");
+
+    for (int row = 0; row < 9; row++)
+        for (int col = 0; col < 135; col++)
+            gfx->fillRect(10 + col * 6, 62 * 0 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+
+    for (int row = 0; row < 9; row++)
+        for (int col = 0; col < 135; col++)
+            gfx->fillRect(10 + col * 6, 62 * 1 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+
+    for (int row = 0; row < 9; row++)
+        for (int col = 0; col < 135; col++)
+            gfx->fillRect(10 + col * 6, 62 * 2 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+
+    for (int row = 0; row < 9; row++)
+        for (int col = 0; col < 135; col++)
+            gfx->fillRect(10 + col * 6, 62 * 3 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+
+    for (int row = 0; row < 9; row++)
+        for (int col = 0; col < 135; col++)
+            gfx->fillRect(10 + col * 6, 62 * 4 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+
+    gfx->setFont(&Font1);
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_DARKORANGE);
+    // y = baseline; cap tops land at y - 26
+    gfx->setCursor(10, 62 * 1);
+    gfx->print("14:28 London St Pan Exp 14:44");
+    gfx->setCursor(10, 62 * 2);
+    gfx->print("Calling at od Junction, East Cr");
+    gfx->setCursor(10, 62 * 3);
+    gfx->print("3rd 14:11 Moorgate     On time");
 }
 
 void loop()

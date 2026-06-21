@@ -1,0 +1,7 @@
+Let's make an Arduino GFX font from @font1.png This file contains glyphs with characters
+ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:;.,-()&/\!?'"+*=^%$@[]{}£<>#|_`€~
+Every glyph is 20 by 36 pixels, though I don't want to make a monospaced font.
+E.g. an exclamation mark in the resulting font can be only 3 pixels width.
+Also, I want to have a 4 px space between the characters, and a spacebar char of 20 pixels width.
+The baseline is 27.
+If you want, I can tell you an actual visible width of every character, not only for exclamation mark, to avoid any confusion. Or you can try determine it from the glyphs.
