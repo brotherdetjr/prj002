@@ -150,7 +150,8 @@ int8_t fontMinYOffset(const GFXfont *font)
     return cache[font] = minYOffset;
 }
 
-void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *text)
+void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *text,
+                        int textLeftShiftInLeds = 0)
 {
     int textBaselineY = topPx - fontMinYOffset(font);
     gfx->setFont(font);
@@ -159,10 +160,39 @@ void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *
     gfx->getTextBounds(text, leftPx, textBaselineY, &tx, &ty, &tw, &th);
     int panelRight = tx + (int)tw + LED_GAP + font->glyph[0].xAdvance;
     int horLedCount = (panelRight - leftPx + LED_DIM - 1) / LED_DIM;
-    drawLedPanel(leftPx, topPx, horLedCount);
-    gfx->setTextColor(RGB565_LEDON);
-    gfx->setCursor(leftPx, textBaselineY);
-    gfx->print(text);
+    int shiftPx = textLeftShiftInLeds * LED_DIM;
+    int panelW = horLedCount * LED_DIM;
+    int panelH = LEDS_IN_ROW * LED_DIM;
+    int textCanvasW = panelW + shiftPx;
+
+    // Draw text at x=0 in a wider canvas; blit only columns [shiftPx..] to avoid
+    // negative-x artifacts (writePixelPreclipped wraps negative x within the row).
+    Arduino_Canvas textCanvas(textCanvasW, panelH, nullptr);
+    textCanvas.begin(GFX_SKIP_OUTPUT_BEGIN);
+    textCanvas.fillScreen(RGB565_BLACK);
+    textCanvas.setFont(font);
+    textCanvas.setTextColor(RGB565_LEDON);
+    textCanvas.setCursor(0, textBaselineY - topPx);
+    textCanvas.print(text);
+
+    Arduino_Canvas panelCanvas(panelW, panelH, gfx, leftPx, topPx);
+    panelCanvas.begin(GFX_SKIP_OUTPUT_BEGIN);
+    panelCanvas.fillScreen(RGB565_BLACK);
+    for (int row = 0; row < LEDS_IN_ROW; row++)
+        for (int col = 0; col < horLedCount; col++)
+            panelCanvas.fillRect(col * LED_DIM, row * LED_DIM, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
+
+    uint16_t *src = textCanvas.getFramebuffer() + shiftPx;
+    uint16_t *dst = panelCanvas.getFramebuffer();
+    for (int y = 0; y < panelH; y++) {
+        for (int x = 0; x < panelW; x++)
+            if (src[x] != RGB565_BLACK)
+                dst[x] = src[x];
+        src += textCanvasW;
+        dst += panelW;
+    }
+
+    panelCanvas.flush();
 }
 
 // Entry points
@@ -177,7 +207,7 @@ void setup()
     gfx->begin();
     gfx->fillScreen(RGB565(0, 0, 100));
 
-    drawTextOnLedPanel(10, 18, &Font1, "11:11");
+    drawTextOnLedPanel(10, 18, &Font1, "12:53", 5);
 
     // for (int row = 0; row < LEDS_IN_ROW; row++)
     //     for (int col = 0; col < 135; col++)
