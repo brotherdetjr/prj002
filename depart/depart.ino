@@ -25,6 +25,14 @@ static void log(const char *fmt, ...)
 }
 
 #define GFX_BL 46
+#define RGB565_LEDOFF RGB565(100, 33, 30)
+#define RGB565_LEDON RGB565_DARKORANGE
+#define SCREEN_WIDTH 820
+#define SCREEN_HEIGHT 320
+#define LED_DIM 6
+#define LED_DIM_ACTIVE 4
+#define ROW_WITH_GAP_HEIGHT 65
+#define LEDS_IN_ROW 9
 
 // Display Pin config: Makerfabs/ESP32-S3_Parallel_TFT_3.16_ST7701S repo,
 // PDQgraphicstest/Arduino_GFX_dev_device.h, #define ESP32_S3_RGB section.
@@ -115,7 +123,7 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
     20 /* vsync_back_porch */);
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    320 /* width */, 820 /* height */, rgbpanel, 1 /* rotation: landscape */,
+    SCREEN_HEIGHT, SCREEN_WIDTH, rgbpanel, 1 /* rotation: landscape */,
     true /* auto_flush */, bus, GFX_NOT_DEFINED /* RST */, init_ops,
     sizeof(init_ops));
 
@@ -131,35 +139,31 @@ void setup()
     gfx->begin();
     gfx->fillScreen(RGB565_BLACK);
 
-    for (int row = 0; row < 9; row++)
+    for (int row = 0; row < LEDS_IN_ROW; row++)
         for (int col = 0; col < 135; col++)
-            gfx->fillRect(10 + col * 6, 62 * 0 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+            gfx->fillRect(10 + col * LED_DIM, ROW_WITH_GAP_HEIGHT * 0 + 18 + row * LED_DIM, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
 
-    for (int row = 0; row < 9; row++)
+    for (int row = 0; row < LEDS_IN_ROW; row++)
         for (int col = 0; col < 135; col++)
-            gfx->fillRect(10 + col * 6, 62 * 1 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+            gfx->fillRect(10 + col * LED_DIM, ROW_WITH_GAP_HEIGHT * 1 + 18 + row * LED_DIM, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
 
-    for (int row = 0; row < 9; row++)
+    for (int row = 0; row < LEDS_IN_ROW; row++)
         for (int col = 0; col < 135; col++)
-            gfx->fillRect(10 + col * 6, 62 * 2 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+            gfx->fillRect(10 + col * LED_DIM, ROW_WITH_GAP_HEIGHT * 2 + 18 + row * LED_DIM, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
 
-    for (int row = 0; row < 9; row++)
-        for (int col = 0; col < 135; col++)
-            gfx->fillRect(10 + col * 6, 62 * 3 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
-
-    for (int row = 0; row < 9; row++)
-        for (int col = 0; col < 135; col++)
-            gfx->fillRect(10 + col * 6, 62 * 4 + 21 + row * 6, 4, 4, RGB565(100, 33, 30));
+    for (int row = 0; row < LEDS_IN_ROW; row++)
+        for (int col = 0; col < 60; col++)
+            gfx->fillRect((SCREEN_WIDTH - 60 * LED_DIM) / 2 + col * LED_DIM, ROW_WITH_GAP_HEIGHT * 4 + row * LED_DIM - 5, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
 
     gfx->setFont(&Font1);
     gfx->setTextSize(1);
-    gfx->setTextColor(RGB565_DARKORANGE);
+    gfx->setTextColor(RGB565_LEDON);
     // y = baseline; cap tops land at y - 26
-    gfx->setCursor(10, 62 * 1);
+    gfx->setCursor(10, ROW_WITH_GAP_HEIGHT * 1 - 5);
     gfx->print("14:28 London St Pan Exp 14:44");
-    gfx->setCursor(10, 62 * 2);
+    gfx->setCursor(10, ROW_WITH_GAP_HEIGHT * 2 - 5);
     gfx->print("Calling at od Junction, East Cr");
-    gfx->setCursor(10, 62 * 3);
+    gfx->setCursor(10, ROW_WITH_GAP_HEIGHT * 3 - 5);
     gfx->print("3rd 14:11 Moorgate     On time");
 }
 

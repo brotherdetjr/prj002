@@ -1,0 +1,12 @@
+font_name: Font2
+image: font2.png
+out_path: depart/font2.h
+cell_w: 54
+cell_h: 54
+baseline: 54
+char_gap: 6
+space_adv: 54
+threshold: 128
+subchar_gap: 2
+chars: >-
+  0123456789:

@@ -1,65 +1,63 @@
 #!/usr/bin/env python3
-"""
-Generate Adafruit GFX font header from font1.png
+"""Generate Adafruit GFX font header from a PNG sprite sheet and YAML config."""
 
-Non-ASCII character mapping:
-  0x7F -> £ (pound sterling)  use FONT1_POUND constant
-  0x80 -> € (euro)            use FONT1_EURO  constant
-"""
+import sys
 
+import yaml
 from PIL import Image
 
-# Characters in left-to-right order as they appear in font1.png
-CHARS = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "abcdefghijklmnopqrstuvwxyz"
-    "0123456789"
-    ":;.,-()&/\\!?'\"+*=^%$@[]{}£<>#|_`€~"
-)
 
-CELL_W = 30
-CELL_H = 54
-BASELINE = 43  # 0-based row index of baseline within cell
-CHAR_GAP = 6  # pixels between characters (added after visible width)
-SPACE_ADV = 24  # xAdvance for ' '
-THRESHOLD = 128  # brightness threshold: >= foreground, < background
-INTERLED_GAP = 2
-FONT_NAME = "Font1"
-OUT_PATH = "depart/font1.h"
-
-
-def char_code(c):
-    if c == "£":
-        return 0x7F
-    if c == "€":
-        return 0x80
+def char_code(c, char_codes):
+    entry = char_codes.get(c)
+    if entry:
+        return entry["code"]
     return ord(c)
 
 
 def main():
-    img = Image.open("font1.png").convert("RGB")
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <config.yaml>", file=sys.stderr)
+        sys.exit(1)
+
+    with open(sys.argv[1]) as f:
+        cfg = yaml.safe_load(f)
+
+    chars = cfg["chars"]
+    cell_w = cfg["cell_w"]
+    cell_h = cfg["cell_h"]
+    baseline = cfg["baseline"]
+    char_gap = cfg["char_gap"]
+    space_adv = cfg["space_adv"]
+    threshold = cfg["threshold"]
+    subchar_gap = cfg["subchar_gap"]
+    font_name = cfg["font_name"]
+    out_path = cfg["out_path"]
+    image_path = cfg["image"]
+    char_codes = cfg.get("char_codes", {})
+
+    img = Image.open(image_path).convert("RGB")
     iw, ih = img.size
     px = img.load()
 
-    expected_w = len(CHARS) * CELL_W
-    if iw != expected_w or ih != CELL_H:
-        raise ValueError(f"Image {iw}x{ih}, expected {expected_w}x{CELL_H}")
-    print(f"Processing {len(CHARS)} chars from {iw}x{ih} image")
+    expected_w = len(chars) * cell_w
+    if iw != expected_w or ih != cell_h:
+        raise ValueError(f"Image {iw}x{ih}, expected {expected_w}x{cell_h}")
+    print(f"Processing {len(chars)} chars from {iw}x{ih} image")
 
     bitmap_bytes = []
     glyphs = {}  # code -> (bitmapOffset, w, h, xAdvance, xOffset, yOffset)
 
-    for i, c in enumerate(CHARS):
-        cx = i * CELL_W
-        code = char_code(c)
+    for i, c in enumerate(chars):
+        cx = i * cell_w
+        code = char_code(c, char_codes)
 
         # Find tight bounding box of lit pixels within the cell
         min_row = min_col = 9999
         max_row = max_col = -1
-        for row in range(CELL_H):
-            for col in range(CELL_W):
+        for row in range(cell_h):
+            for col in range(cell_w):
                 r, g, b = px[cx + col, row]
-                if max(r, g, b) >= THRESHOLD:
+                if max(r, g, b) >= threshold:
                     if row < min_row:
                         min_row = row
                     if row > max_row:
@@ -70,28 +68,26 @@ def main():
                         max_col = col
 
         if max_row == -1:
-            glyphs[code] = (0, 0, 0, CHAR_GAP, 0, 0)
+            glyphs[code] = (0, 0, 0, char_gap, 0, 0)
             print(f"  0x{code:02X} '{c}': (empty)")
             continue
 
         gw = max_col - min_col + 1
         gh = max_row - min_row + 1
-        # Add 2 dark columns on the right (inter-LED gap) unless the visible
-        # width is already divisible by 4.
-        pad = INTERLED_GAP
-        gw += pad
-        x_advance = gw + CHAR_GAP
+        # Add dark columns on the right (sub-character gap) for inter-LED spacing
+        gw += subchar_gap
+        x_advance = gw + char_gap
         x_offset = 0  # crop left margin, start at cursor
-        y_offset = min_row - BASELINE  # negative = above baseline
+        y_offset = min_row - baseline + 1  # negative = above baseline
 
         # Pack bits MSB-first, no row padding, pad last byte with zeros
         bits = []
         for row in range(min_row, max_row + 1):
             for col in range(min_col, max_col + 1):
                 r, g, b = px[cx + col, row]
-                bits.append(1 if max(r, g, b) >= THRESHOLD else 0)
-            for _ in range(pad):
-                bits.append(0)  # inter-LED gap column
+                bits.append(1 if max(r, g, b) >= threshold else 0)
+            for _ in range(subchar_gap):
+                bits.append(0)
 
         bitmap_offset = len(bitmap_bytes)
         for j in range(0, len(bits), 8):
@@ -107,40 +103,53 @@ def main():
             f"  0x{code:02X} '{c}': w={gw:2d} h={gh:2d} xa={x_advance:2d} yo={y_offset:+d}"
         )
 
-    # Space is not in CHARS (drawn implicitly), add it manually
-    glyphs[0x20] = (0, 0, 0, SPACE_ADV, 0, 0)
+    # Space is not in chars (drawn implicitly), add it manually
+    glyphs[0x20] = (0, 0, 0, space_adv, 0, 0)
 
     first_code = 0x20
     last_code = max(glyphs.keys())
 
+    # Special chars that are both in chars and have a named constant
+    font_prefix = font_name.upper()
+    named_specials = {
+        c: info for c, info in char_codes.items() if c in chars and "constant" in info
+    }
+
     # ── build header ──────────────────────────────────────────────────────────
     out = []
-    out.append(f"// Generated by font_gen.py from font1.png")
-    out.append(f"// Non-ASCII: 0x7F=£  0x80=€")
+    out.append(f"// Generated by font_gen.py from {image_path}")
+    if named_specials:
+        parts = " ".join(
+            f"0x{info['code']:02X}={c}" for c, info in named_specials.items()
+        )
+        out.append(f"// Non-ASCII: {parts}")
     out.append("#pragma once")
     out.append("")
-    out.append("#define FONT1_POUND 0x7F  // £")
-    out.append("#define FONT1_EURO  0x80  // €")
-    out.append("")
+    for c, info in named_specials.items():
+        out.append(
+            f"#define {font_prefix}_{info['constant']} 0x{info['code']:02X}  // {c}"
+        )
+    if named_specials:
+        out.append("")
 
-    out.append(f"const uint8_t {FONT_NAME}Bitmaps[] PROGMEM = {{")
+    out.append(f"const uint8_t {font_name}Bitmaps[] PROGMEM = {{")
     for i in range(0, len(bitmap_bytes), 16):
         chunk = bitmap_bytes[i : i + 16]
         out.append("  " + ", ".join(f"0x{b:02X}" for b in chunk) + ",")
     out.append("};")
     out.append("")
 
-    out.append(f"const GFXglyph {FONT_NAME}Glyphs[] PROGMEM = {{")
+    code_to_special = {info["code"]: c for c, info in char_codes.items()}
+
+    out.append(f"const GFXglyph {font_name}Glyphs[] PROGMEM = {{")
     out.append("  // bitmapOffset, width, height, xAdvance, xOffset, yOffset")
     for code in range(first_code, last_code + 1):
         if code in glyphs:
             bo, gw, gh, xa, xo, yo = glyphs[code]
             if code == 0x20:
                 label = "' '"
-            elif code == 0x7F:
-                label = "'£'"
-            elif code == 0x80:
-                label = "'€'"
+            elif code in code_to_special:
+                label = f"'{code_to_special[code]}'"
             elif 0x21 <= code < 0x7F:
                 ch = chr(code)
                 label = f'"{ch}"' if ch == "'" else f"'{ch}'"
@@ -156,19 +165,19 @@ def main():
     out.append("};")
     out.append("")
 
-    out.append(f"const GFXfont {FONT_NAME} PROGMEM = {{")
-    out.append(f"  (uint8_t  *){FONT_NAME}Bitmaps,")
-    out.append(f"  (GFXglyph *){FONT_NAME}Glyphs,")
+    out.append(f"const GFXfont {font_name} PROGMEM = {{")
+    out.append(f"  (uint8_t  *){font_name}Bitmaps,")
+    out.append(f"  (GFXglyph *){font_name}Glyphs,")
     out.append(f"  0x{first_code:02X},  // first (space)")
-    out.append(f"  0x{last_code:02X},  // last (euro)")
-    out.append(f"  {CELL_H}     // yAdvance")
+    out.append(f"  0x{last_code:02X},  // last")
+    out.append(f"  {cell_h}     // yAdvance")
     out.append("};")
 
     header = "\n".join(out) + "\n"
-    with open(OUT_PATH, "w") as f:
+    with open(out_path, "w") as f:
         f.write(header)
 
-    print(f"\nWrote {OUT_PATH}")
+    print(f"\nWrote {out_path}")
     print(f"  bitmap: {len(bitmap_bytes)} bytes")
     print(
         f"  glyphs: {last_code - first_code + 1} entries (0x{first_code:02X}–0x{last_code:02X})"

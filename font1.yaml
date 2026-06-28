@@ -1,0 +1,15 @@
+font_name: Font1
+image: font1.png
+out_path: depart/font1.h
+cell_w: 30
+cell_h: 54
+baseline: 42
+char_gap: 6
+space_adv: 24
+threshold: 128
+subchar_gap: 2
+chars: >-
+  ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:;.,-()&/\!?'"+*=^%$@[]{}£<>#|_`€~
+char_codes:
+  "£": { code: 0x7F, constant: POUND }
+  "€": { code: 0x80, constant: EURO }
