@@ -1,4 +1,5 @@
 #include <Arduino_GFX_Library.h>
+#include <map>
 #include <sys/time.h>
 #include <time.h>
 
@@ -136,13 +137,22 @@ void drawLedPanel(int leftPx, int topPx, int horLedCount)
             gfx->fillRect(col * LED_DIM + leftPx, row * LED_DIM + topPx, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
 }
 
-void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *text)
+int8_t fontMinYOffset(const GFXfont *font)
 {
+    static std::map<const GFXfont *, int8_t> cache;
+    auto it = cache.find(font);
+    if (it != cache.end())
+        return it->second;
     int8_t minYOffset = 0;
     for (uint16_t i = 0; i <= font->last - font->first; i++)
         if (font->glyph[i].yOffset < minYOffset)
             minYOffset = font->glyph[i].yOffset;
-    int textBaselineY = topPx - minYOffset;
+    return cache[font] = minYOffset;
+}
+
+void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *text)
+{
+    int textBaselineY = topPx - fontMinYOffset(font);
     gfx->setFont(font);
     int16_t tx, ty;
     uint16_t tw, th;
