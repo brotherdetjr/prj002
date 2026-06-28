@@ -31,6 +31,7 @@ static void log(const char *fmt, ...)
 #define SCREEN_HEIGHT 320
 #define LED_DIM 6
 #define LED_DIM_ACTIVE 4
+#define LED_GAP (LED_DIM - LED_DIM_ACTIVE)
 #define ROW_WITH_GAP_HEIGHT 65
 #define LEDS_IN_ROW 9
 
@@ -129,10 +130,29 @@ Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
 
 void drawLedPanel(int leftPx, int topPx, int horLedCount)
 {
-    gfx->fillRect(leftPx, topPx, horLedCount * LED_DIM_ACTIVE, LEDS_IN_ROW * LED_DIM_ACTIVE, RGB565_BLACK);
+    gfx->fillRect(leftPx, topPx, horLedCount * LED_DIM, LEDS_IN_ROW * LED_DIM, RGB565_BLACK);
     for (int row = 0; row < LEDS_IN_ROW; row++)
         for (int col = 0; col < horLedCount; col++)
             gfx->fillRect(col * LED_DIM + leftPx, row * LED_DIM + topPx, LED_DIM_ACTIVE, LED_DIM_ACTIVE, RGB565_LEDOFF);
+}
+
+void drawTextOnLedPanel(int leftPx, int topPx, const GFXfont *font, const char *text)
+{
+    int8_t minYOffset = 0;
+    for (uint16_t i = 0; i <= font->last - font->first; i++)
+        if (font->glyph[i].yOffset < minYOffset)
+            minYOffset = font->glyph[i].yOffset;
+    int textBaselineY = topPx - minYOffset;
+    gfx->setFont(font);
+    int16_t tx, ty;
+    uint16_t tw, th;
+    gfx->getTextBounds(text, leftPx, textBaselineY, &tx, &ty, &tw, &th);
+    int panelRight = tx + (int)tw + LED_GAP + font->glyph[0].xAdvance;
+    int horLedCount = (panelRight - leftPx + LED_DIM - 1) / LED_DIM;
+    drawLedPanel(leftPx, topPx, horLedCount);
+    gfx->setTextColor(RGB565_LEDON);
+    gfx->setCursor(leftPx, textBaselineY);
+    gfx->print(text);
 }
 
 // Entry points
@@ -145,13 +165,9 @@ void setup()
     pinMode(GFX_BL, OUTPUT);
     digitalWrite(GFX_BL, LOW); // NPN transistor: LOW = backlight on
     gfx->begin();
-    gfx->fillScreen(RGB565_BLACK);
+    gfx->fillScreen(RGB565(0, 0, 100));
 
-    drawLedPanel(10, 18, 30);
-    gfx->setFont(&Font1);
-    gfx->setTextColor(RGB565_LEDON);
-    gfx->setCursor(10, 60);
-    gfx->print("22:22");
+    drawTextOnLedPanel(10, 18, &Font1, "11:11");
 
     // for (int row = 0; row < LEDS_IN_ROW; row++)
     //     for (int col = 0; col < 135; col++)
