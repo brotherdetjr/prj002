@@ -1,2 +1,5 @@
 backups/
 .claude/settings.local.json
+server/certs/
+local/
+server/server
